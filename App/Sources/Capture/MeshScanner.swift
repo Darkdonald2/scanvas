@@ -14,8 +14,10 @@ struct Keyframe {
     var fx: Float, fy: Float, cx: Float, cy: Float
     /// Index of the sharp photo saved for this keyframe (`photo_<n>.jpg`), or −1.
     var photo = -1
+    /// Image sharpness (variance of the Laplacian); low means motion blur.
+    var sharpness: Float = 1
 
-    static let photoWidth = 1280, photoHeight = 960
+    static let photoWidth = 1600, photoHeight = 1200
     static func photoName(_ n: Int) -> String { "photo_\(n).jpg" }
 }
 
@@ -29,7 +31,7 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
 
     let arView: ARView
     var captureColour = true
-    var maxKeyframes = 300
+    var maxKeyframes = 700
 
     private var keyframes: [Keyframe] = []
     private var lastKeyTransform: simd_float4x4?
@@ -40,6 +42,7 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
     /// Where sharp photos are written while scanning (nil = colour only).
     var photoDirectory: URL?
     private var photoCount = 0
+    private var sharpnessMean: Float = 0
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let photoQueue = DispatchQueue(label: "scanvas.photos", qos: .utility)
 
@@ -99,11 +102,15 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
                                       SIMD3(last.columns.3.x, last.columns.3.y, last.columns.3.z))
             let turned = acos(min(1, max(-1, simd_dot(SIMD3(t.columns.2.x, t.columns.2.y, t.columns.2.z),
                                                        SIMD3(last.columns.2.x, last.columns.2.y, last.columns.2.z)))))
-            guard now - lastKeyTime > 0.4, moved > 0.25 || turned > 0.22 else { return }
+            guard now - lastKeyTime > 0.2, moved > 0.1 || turned > 0.1 else { return }
         }
+        guard var kf = Self.makeKeyframe(frame) else { return }
+        // Skip motion-blurred frames unless it has been a while since the last photo.
+        if sharpnessMean > 0 && kf.sharpness < sharpnessMean * 0.6 && now - lastKeyTime < 1.5 { return }
+        sharpnessMean = sharpnessMean == 0 ? kf.sharpness : sharpnessMean * 0.9 + kf.sharpness * 0.1
         lastKeyTransform = t
         lastKeyTime = now
-        if var kf = Self.makeKeyframe(frame) {
+        do {
             if let dir = photoDirectory, let cg = photo(from: frame) {
                 kf.photo = photoCount
                 let url = dir.appendingPathComponent(Keyframe.photoName(photoCount))
@@ -194,12 +201,23 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
             CVPixelBufferUnlockBaseAddress(dm, .readOnly)
         }
 
+        // Sharpness: variance of the Laplacian of the green channel.
+        var sum: Float = 0, sum2: Float = 0, n: Float = 0
+        for j in 1..<(h - 1) {
+            for i in 1..<(w - 1) {
+                let o = (j * w + i) * 3 + 1
+                let lap = 4 * Float(rgb[o]) - Float(rgb[o - 3]) - Float(rgb[o + 3]) - Float(rgb[o - w * 3]) - Float(rgb[o + w * 3])
+                sum += lap; sum2 += lap * lap; n += 1
+            }
+        }
+        let sharpness = max(1, sum2 / n - (sum / n) * (sum / n))
+
         let k = frame.camera.intrinsics
         let sx = Float(w) / Float(W), sy = Float(h) / Float(H)
         let t = frame.camera.transform
         return Keyframe(rgb: rgb, depth: depth, worldToCamera: t.inverse,
                         cameraPosition: SIMD3(t.columns.3.x, t.columns.3.y, t.columns.3.z),
-                        fx: k[0][0] * sx, fy: k[1][1] * sy, cx: k[2][0] * sx, cy: k[2][1] * sy)
+                        fx: k[0][0] * sx, fy: k[1][1] * sy, cx: k[2][0] * sx, cy: k[2][1] * sy, sharpness: sharpness)
     }
 
     // MARK: Building the result

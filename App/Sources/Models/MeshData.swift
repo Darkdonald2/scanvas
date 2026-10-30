@@ -263,3 +263,82 @@ func rgb(_ v: SIMD3<Float>) -> SIMD3<UInt8> {
     func c(_ x: Float) -> UInt8 { UInt8(max(0, min(255, x.rounded()))) }
     return SIMD3(c(v.x), c(v.y), c(v.z))
 }
+
+// MARK: - Smoothing
+
+extension MeshData {
+    /// Merges vertices that sit on top of each other (ARKit repeats them where mesh anchors meet).
+    func welded(tolerance: Float = 0.002) -> MeshData {
+        struct Key: Hashable { var x: Int32, y: Int32, z: Int32 }
+        var map: [Key: UInt32] = [:]
+        map.reserveCapacity(positions.count)
+        var remap = [UInt32](repeating: 0, count: positions.count)
+        var out = MeshData()
+        let keepColors = hasColors, keepNormals = hasNormals
+        for (i, p) in positions.enumerated() {
+            let k = Key(x: Int32((p.x / tolerance).rounded()), y: Int32((p.y / tolerance).rounded()), z: Int32((p.z / tolerance).rounded()))
+            if let j = map[k] { remap[i] = j; continue }
+            let j = UInt32(out.positions.count)
+            map[k] = j; remap[i] = j
+            out.positions.append(p)
+            if keepNormals { out.normals.append(normals[i]) }
+            if keepColors { out.colors.append(colors[i]) }
+        }
+        let keepClasses = faceClasses.count == triangleCount
+        for t in 0..<triangleCount {
+            let a = remap[Int(indices[3 * t])], b = remap[Int(indices[3 * t + 1])], c = remap[Int(indices[3 * t + 2])]
+            if a == b || b == c || a == c { continue }
+            out.indices += [a, b, c]
+            if keepClasses { out.faceClasses.append(faceClasses[t]) }
+        }
+        return out
+    }
+
+    /// Taubin smoothing: irons out LiDAR noise without shrinking the scan.
+    func smoothed(iterations: Int = 4) -> MeshData {
+        guard !isEmpty else { return self }
+        var m = welded()
+        let n = m.positions.count
+        // Neighbour lists from triangle edges.
+        var neighbours = [[UInt32]](repeating: [], count: n)
+        for t in 0..<m.triangleCount {
+            let v = [m.indices[3 * t], m.indices[3 * t + 1], m.indices[3 * t + 2]]
+            for (a, b) in [(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
+                if !neighbours[Int(a)].contains(b) { neighbours[Int(a)].append(b) }
+                if !neighbours[Int(b)].contains(a) { neighbours[Int(b)].append(a) }
+            }
+        }
+        // Boundary vertices (on an edge used by only one triangle) stay put so holes don't grow.
+        var edgeUse: [UInt64: UInt8] = [:]
+        for t in 0..<m.triangleCount {
+            for k in 0..<3 {
+                let a = m.indices[3 * t + k], b = m.indices[3 * t + (k + 1) % 3]
+                let key = UInt64(min(a, b)) << 32 | UInt64(max(a, b))
+                edgeUse[key, default: 0] &+= 1
+            }
+        }
+        var fixed = [Bool](repeating: false, count: n)
+        for (key, uses) in edgeUse where uses == 1 {
+            fixed[Int(key >> 32)] = true; fixed[Int(key & 0xFFFF_FFFF)] = true
+        }
+        var p = m.positions
+        func step(_ factor: Float) {
+            var next = p
+            for i in 0..<n where !fixed[i] && !neighbours[i].isEmpty {
+                var avg = SIMD3<Float>.zero
+                for j in neighbours[i] { avg += p[Int(j)] }
+                avg /= Float(neighbours[i].count)
+                next[i] = p[i] + factor * (avg - p[i])
+            }
+            p = next
+        }
+        for _ in 0..<iterations { step(0.5); step(-0.53) }
+        m.positions = p
+        m.computeNormals()
+        // Keep normals facing the same way ARKit had them (towards where the scanner stood).
+        if hasNormals && !SceneExport.facesTowardNormals(self) {
+            m.normals = m.normals.map { -$0 }
+        }
+        return m
+    }
+}

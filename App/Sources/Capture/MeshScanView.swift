@@ -14,6 +14,7 @@ struct MeshScanView: View {
     @StateObject private var scanner = MeshScanner()
     @Environment(\.dismiss) private var dismiss
     @AppStorage("captureColour") private var captureColour = true
+    @AppStorage("smoothMesh") private var smoothMesh = true
     @State private var saving = false
     @State private var status = ""
     @State private var errorMessage: String?
@@ -94,6 +95,7 @@ struct MeshScanView: View {
         scanner.stop()
         let project = self.project
         let colour = captureColour
+        let smooth = smoothMesh
         let scanner = self.scanner
         Task.detached(priority: .userInitiated) {
             var mesh = collected
@@ -104,6 +106,10 @@ struct MeshScanView: View {
             }
             do {
                 try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                if smooth {
+                    report("Smoothing mesh…", 0.01)
+                    mesh = mesh.smoothed()
+                }
                 if colour {
                     report("Colouring mesh…", 0.02)
                     scanner.colourize(&mesh) { p in report("Colouring mesh…", 0.02 + 0.08 * p) }

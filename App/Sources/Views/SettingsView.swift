@@ -6,6 +6,7 @@ struct SettingsView: View {
     @AppStorage("cadUnit") private var cadUnitRaw = CADUnit.millimetres.rawValue
     @AppStorage("wallThickness") private var wallThickness = 0.12
     @AppStorage("captureColour") private var captureColour = true
+    @AppStorage("smoothMesh") private var smoothMesh = true
 
     var body: some View {
         NavigationStack {
@@ -26,9 +27,10 @@ struct SettingsView: View {
                     Text("RoomPlan measures wall surfaces, not their thickness. This value is used for walls in DXF, IFC and 3D exports.")
                 }
                 Section {
-                    Toggle("Capture colour", isOn: $captureColour)
+                    Toggle("Photo textures", isOn: $captureColour)
+                    Toggle("Smooth mesh", isOn: $smoothMesh)
                 } header: { Text("Space scans") } footer: {
-                    Text("Keeps small camera snapshots while scanning to colour the mesh. Turn off for very long scans to save memory.")
+                    Text("Photo textures: takes photos while you scan and wraps the mesh in them afterwards. Smooth mesh: removes LiDAR bumps and noise. Turn photo textures off for very long scans to save memory.")
                 }
                 Section("About") {
                     LabeledContent("Version", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")

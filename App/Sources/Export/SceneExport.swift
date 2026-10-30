@@ -72,6 +72,7 @@ enum SceneExport {
             let mat = SCNMaterial()
             mat.diffuse.contents = folder.appendingPathComponent(TexturedMesh.textureName(i))
             mat.diffuse.mipFilter = .linear
+            mat.diffuse.maxAnisotropy = 16
             // The photos already contain the room's real lighting.
             mat.lightingModel = .constant
             mat.fillMode = wireframe ? .lines : .fill
