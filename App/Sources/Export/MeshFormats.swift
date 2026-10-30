@@ -162,6 +162,117 @@ enum MeshFormats {
         try d.write(to: url, options: .atomic)
     }
 
+    // MARK: Textured
+
+    /// OBJ + MTL + JPEG textures in `dir` (Y-up, UV origin bottom-left as OBJ expects).
+    static func texturedOBJ(_ t: TexturedMesh, textures: URL, name: String, in dir: URL) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        var mtl = "# Exported by Scanvas\n"
+        for i in t.pages.indices {
+            mtl += "newmtl photo\(i)\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\nillum 1\nmap_Kd \(TexturedMesh.textureName(i))\n\n"
+            let dst = dir.appendingPathComponent(TexturedMesh.textureName(i))
+            try? fm.removeItem(at: dst)
+            try fm.copyItem(at: textures.appendingPathComponent(TexturedMesh.textureName(i)), to: dst)
+        }
+        mtl += "newmtl untextured\nKd 0.7 0.7 0.7\nillum 1\n"
+        try mtl.write(to: dir.appendingPathComponent(name + ".mtl"), atomically: true, encoding: .utf8)
+
+        let out = try TextFileWriter(url: dir.appendingPathComponent(name + ".obj"))
+        out.line("# Exported by Scanvas")
+        out.line("mtllib \(name).mtl")
+        var base = 1
+        for (i, p) in t.pages.enumerated() where !p.indices.isEmpty {
+            out.line("o photo_part_\(i)")
+            out.line("usemtl photo\(i)")
+            for v in p.positions { out.line("v \(num(v.x)) \(num(v.y)) \(num(v.z))") }
+            for uv in p.uvs { out.line("vt \(num(uv.x, 100000)) \(num(1 - uv.y, 100000))") }
+            for tri in 0..<(p.indices.count / 3) {
+                let a = Int(p.indices[3 * tri]) + base, b = Int(p.indices[3 * tri + 1]) + base, c = Int(p.indices[3 * tri + 2]) + base
+                out.line("f \(a)/\(a) \(b)/\(b) \(c)/\(c)")
+            }
+            base += p.positions.count
+        }
+        let rest = t.untextured
+        if !rest.isEmpty {
+            out.line("o untextured")
+            out.line("usemtl untextured")
+            for v in rest.positions { out.line("v \(num(v.x)) \(num(v.y)) \(num(v.z))") }
+            for tri in 0..<rest.triangleCount {
+                out.line("f \(Int(rest.indices[3 * tri]) + base) \(Int(rest.indices[3 * tri + 1]) + base) \(Int(rest.indices[3 * tri + 2]) + base)")
+            }
+        }
+        out.close()
+    }
+
+    /// glTF binary with the photo textures embedded.
+    static func texturedGLB(_ t: TexturedMesh, textures: URL, to url: URL) throws {
+        var bin = Data()
+        var bufferViews: [[String: Any]] = [], accessors: [[String: Any]] = [], meshes: [[String: Any]] = [], nodes: [[String: Any]] = []
+        var images: [[String: Any]] = [], materials: [[String: Any]] = [], texturesJSON: [[String: Any]] = []
+
+        func view(_ data: Data, target: Int?) -> Int {
+            while bin.count % 4 != 0 { bin.append(0) }
+            var v: [String: Any] = ["buffer": 0, "byteOffset": bin.count, "byteLength": data.count]
+            if let target { v["target"] = target }
+            bufferViews.append(v)
+            bin.append(data)
+            return bufferViews.count - 1
+        }
+        func accessor(_ data: Data, type: String, componentType: Int, count: Int, target: Int, min: [Float]? = nil, max: [Float]? = nil) -> Int {
+            var a: [String: Any] = ["bufferView": view(data, target: target), "componentType": componentType, "count": count, "type": type]
+            if let min, let max { a["min"] = min; a["max"] = max }
+            accessors.append(a)
+            return accessors.count - 1
+        }
+
+        for (i, p) in t.pages.enumerated() where !p.indices.isEmpty {
+            let jpeg = try Data(contentsOf: textures.appendingPathComponent(TexturedMesh.textureName(i)))
+            images.append(["bufferView": view(jpeg, target: nil), "mimeType": "image/jpeg"])
+            texturesJSON.append(["source": images.count - 1])
+            materials.append(["name": "photo\(i)", "doubleSided": true, "extensions": ["KHR_materials_unlit": [String: Any]()],
+                              "pbrMetallicRoughness": ["baseColorTexture": ["index": texturesJSON.count - 1], "metallicFactor": 0, "roughnessFactor": 1]])
+            var pos = Data(), uv = Data(), idx = Data()
+            var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude), hi = -lo
+            for v in p.positions { append(&pos, v.x); append(&pos, v.y); append(&pos, v.z); lo = simd_min(lo, v); hi = simd_max(hi, v) }
+            for c in p.uvs { append(&uv, c.x); append(&uv, c.y) }
+            for k in p.indices { append(&idx, k) }
+            var attributes: [String: Int] = [
+                "POSITION": accessor(pos, type: "VEC3", componentType: 5126, count: p.positions.count, target: 34962,
+                                     min: [lo.x, lo.y, lo.z], max: [hi.x, hi.y, hi.z]),
+                "TEXCOORD_0": accessor(uv, type: "VEC2", componentType: 5126, count: p.uvs.count, target: 34962),
+            ]
+            if p.normals.count == p.positions.count {
+                var nd = Data()
+                for n in p.normals { append(&nd, n.x); append(&nd, n.y); append(&nd, n.z) }
+                attributes["NORMAL"] = accessor(nd, type: "VEC3", componentType: 5126, count: p.normals.count, target: 34962)
+            }
+            let indices = accessor(idx, type: "SCALAR", componentType: 5125, count: p.indices.count, target: 34963)
+            meshes.append(["name": "photo\(i)", "primitives": [["attributes": attributes, "indices": indices, "material": materials.count - 1, "mode": 4]]])
+            nodes.append(["name": "photo\(i)", "mesh": meshes.count - 1])
+        }
+        while bin.count % 4 != 0 { bin.append(0) }
+
+        var json: [String: Any] = [
+            "asset": ["version": "2.0", "generator": "Scanvas"],
+            "scene": 0,
+            "scenes": [["nodes": Array(0..<nodes.count)]],
+            "nodes": nodes, "meshes": meshes, "accessors": accessors, "bufferViews": bufferViews,
+            "buffers": [["byteLength": bin.count]],
+            "materials": materials, "textures": texturesJSON, "images": images,
+            "samplers": [["magFilter": 9729, "minFilter": 9987]],
+            "extensionsUsed": ["KHR_materials_unlit"],
+        ]
+        if images.isEmpty { json["textures"] = nil; json["images"] = nil }
+        var jsonData = try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys])
+        while jsonData.count % 4 != 0 { jsonData.append(0x20) }
+        var d = Data()
+        append(&d, UInt32(0x4654_6C67)); append(&d, UInt32(2)); append(&d, UInt32(12 + 8 + jsonData.count + 8 + bin.count))
+        append(&d, UInt32(jsonData.count)); append(&d, UInt32(0x4E4F_534A)); d.append(jsonData)
+        append(&d, UInt32(bin.count)); append(&d, UInt32(0x004E_4942)); d.append(bin)
+        try d.write(to: url, options: .atomic)
+    }
+
     // MARK: Helpers
 
     @inline(__always) static func append<T>(_ d: inout Data, _ v: T) {

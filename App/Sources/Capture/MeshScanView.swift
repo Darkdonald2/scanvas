@@ -1,5 +1,6 @@
 import SwiftUI
 import RealityKit
+import SceneKit
 
 private struct ARViewContainer: UIViewRepresentable {
     let arView: ARView
@@ -16,6 +17,8 @@ struct MeshScanView: View {
     @State private var saving = false
     @State private var status = ""
     @State private var errorMessage: String?
+    @State private var progress: Double = 0
+    @State private var project = ScanProject(name: "", kind: .space)
     var onSaved: (ScanProject) -> Void
 
     var body: some View {
@@ -24,7 +27,7 @@ struct MeshScanView: View {
 
             VStack(spacing: 10) {
                 HStack {
-                    Button("Cancel") { scanner.stop(); dismiss() }
+                    Button("Cancel") { scanner.stop(); try? FileManager.default.removeItem(at: ProjectStore.folder(for: project.id)); dismiss() }
                         .buttonStyle(.bordered).tint(.white)
                     Spacer()
                     VStack(alignment: .trailing, spacing: 2) {
@@ -55,14 +58,22 @@ struct MeshScanView: View {
 
             if saving {
                 VStack(spacing: 12) {
-                    ProgressView()
-                    Text(status).font(.callout)
+                    Text("Processing scan").font(.headline)
+                    ProgressView(value: progress).frame(width: 220)
+                    Text(status).font(.callout).multilineTextAlignment(.center)
+                    Text("Keep the app open.").font(.caption).foregroundStyle(.secondary)
                 }
                 .padding(24).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
             }
         }
         .onAppear {
             scanner.captureColour = captureColour
+            project.name = store.nextName(for: .space)
+            if captureColour {
+                let photos = ProjectStore.folder(for: project.id).appendingPathComponent(ProjectFile.keyframes, isDirectory: true)
+                try? FileManager.default.createDirectory(at: photos, withIntermediateDirectories: true)
+                scanner.photoDirectory = photos
+            }
             scanner.start()
         }
         .onDisappear { scanner.stop() }
@@ -81,24 +92,42 @@ struct MeshScanView: View {
         status = "Collecting mesh…"
         let collected = scanner.collectMesh()
         scanner.stop()
-        let project = ScanProject(name: store.nextName(for: .space), kind: .space)
+        let project = self.project
         let colour = captureColour
         let scanner = self.scanner
         Task.detached(priority: .userInitiated) {
             var mesh = collected
+            let folder = ProjectStore.folder(for: project.id)
+            let photos = folder.appendingPathComponent(ProjectFile.keyframes, isDirectory: true)
+            func report(_ text: String, _ value: Double) {
+                Task { @MainActor in status = text; progress = value }
+            }
             do {
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
                 if colour {
-                    await MainActor.run { status = "Colouring mesh…" }
-                    scanner.colourize(&mesh) { p in
-                        Task { @MainActor in status = "Colouring mesh… \(Int(p * 100))%" }
+                    report("Colouring mesh…", 0.02)
+                    scanner.colourize(&mesh) { p in report("Colouring mesh…", 0.02 + 0.08 * p) }
+                }
+                try mesh.write(to: folder.appendingPathComponent(ProjectFile.mesh))
+                var thumbScene: SCNScene?
+                if colour {
+                    let frames = scanner.photoKeyframes()
+                    let textured = try Texturer.build(mesh: mesh, keyframes: frames, photos: photos, output: folder) { p in
+                        report(p.message, 0.1 + 0.9 * p.fraction)
+                    }
+                    if !textured.pages.isEmpty {
+                        try textured.write(to: folder.appendingPathComponent(ProjectFile.textured))
+                        thumbScene = SceneExport.texturedScene(textured, folder: folder, dollhouse: false)
                     }
                 }
                 scanner.clearKeyframes()
-                let folder = ProjectStore.folder(for: project.id)
-                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-                try mesh.write(to: folder.appendingPathComponent(ProjectFile.mesh))
-                let preview = mesh.triangleCount > 300_000 ? mesh.simplified(cell: 0.05) : mesh
-                if let thumb = SceneExport.thumbnail(of: SceneExport.scene(parts: [("Scan", preview)])) {
+                try? FileManager.default.removeItem(at: photos)
+                report("Saving…", 0.99)
+                if thumbScene == nil {
+                    let preview = mesh.triangleCount > 300_000 ? mesh.simplified(cell: 0.05) : mesh
+                    thumbScene = SceneExport.scene(parts: [("Scan", preview)])
+                }
+                if let scene = thumbScene, let thumb = SceneExport.thumbnail(of: scene) {
                     try? thumb.write(to: folder.appendingPathComponent(ProjectFile.thumbnail))
                 }
                 let b = mesh.bounds

@@ -1,5 +1,7 @@
 import ARKit
 import RealityKit
+import CoreImage
+import UIKit
 import simd
 
 /// A downscaled camera image plus depth, kept during a scan so the mesh can be coloured afterwards.
@@ -10,6 +12,11 @@ struct Keyframe {
     var worldToCamera: simd_float4x4
     var cameraPosition: SIMD3<Float>
     var fx: Float, fy: Float, cx: Float, cy: Float
+    /// Index of the sharp photo saved for this keyframe (`photo_<n>.jpg`), or −1.
+    var photo = -1
+
+    static let photoWidth = 1280, photoHeight = 960
+    static func photoName(_ n: Int) -> String { "photo_\(n).jpg" }
 }
 
 /// Large-space LiDAR scanning: ARKit scene reconstruction with live mesh, keyframes for colour.
@@ -22,7 +29,7 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
 
     let arView: ARView
     var captureColour = true
-    var maxKeyframes = 400
+    var maxKeyframes = 300
 
     private var keyframes: [Keyframe] = []
     private var lastKeyTransform: simd_float4x4?
@@ -30,6 +37,11 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
     private var lastStatsTime: TimeInterval = 0
     private var startTime = Date()
     private let lock = NSLock()
+    /// Where sharp photos are written while scanning (nil = colour only).
+    var photoDirectory: URL?
+    private var photoCount = 0
+    private let ciContext = CIContext(options: [.cacheIntermediates: false])
+    private let photoQueue = DispatchQueue(label: "scanvas.photos", qos: .utility)
 
     static var isSupported: Bool { ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) }
 
@@ -87,11 +99,19 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
                                       SIMD3(last.columns.3.x, last.columns.3.y, last.columns.3.z))
             let turned = acos(min(1, max(-1, simd_dot(SIMD3(t.columns.2.x, t.columns.2.y, t.columns.2.z),
                                                        SIMD3(last.columns.2.x, last.columns.2.y, last.columns.2.z)))))
-            guard now - lastKeyTime > 0.35, moved > 0.2 || turned > 0.25 else { return }
+            guard now - lastKeyTime > 0.4, moved > 0.25 || turned > 0.22 else { return }
         }
         lastKeyTransform = t
         lastKeyTime = now
-        if let kf = Self.makeKeyframe(frame) {
+        if var kf = Self.makeKeyframe(frame) {
+            if let dir = photoDirectory, let cg = photo(from: frame) {
+                kf.photo = photoCount
+                let url = dir.appendingPathComponent(Keyframe.photoName(photoCount))
+                photoCount += 1
+                photoQueue.async {
+                    try? UIImage(cgImage: cg).jpegData(compressionQuality: 0.88)?.write(to: url)
+                }
+            }
             lock.lock()
             keyframes.append(kf)
             if keyframes.count > maxKeyframes {
@@ -100,6 +120,21 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
             }
             lock.unlock()
         }
+    }
+
+    /// The camera image scaled to 1280×960 (same framing as the keyframe).
+    private func photo(from frame: ARFrame) -> CGImage? {
+        let image = CIImage(cvPixelBuffer: frame.capturedImage)
+        let sx = CGFloat(Keyframe.photoWidth) / image.extent.width, sy = CGFloat(Keyframe.photoHeight) / image.extent.height
+        let scaled = image.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
+        return ciContext.createCGImage(scaled, from: CGRect(x: 0, y: 0, width: Keyframe.photoWidth, height: Keyframe.photoHeight))
+    }
+
+    /// Waits for pending photo writes and returns the keyframes that have photos.
+    func photoKeyframes() -> [Keyframe] {
+        photoQueue.sync {}
+        lock.lock(); defer { lock.unlock() }
+        return keyframes.filter { $0.photo >= 0 }
     }
 
     static func message(for state: ARCamera.TrackingState) -> String? {

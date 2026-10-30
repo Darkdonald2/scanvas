@@ -32,7 +32,7 @@ enum ExportFormat: String, CaseIterable, Identifiable {
         case .ifc: return "Revit (Open or Link IFC), ArchiCAD, BIM viewers."
         case .pdfPlan: return "Printable plan with dimensions and area."
         case .pngPlan: return "Plan image for messages and docs."
-        case .obj: return "Revit 2024+, SketchUp, Blender, 3ds Max, Rhino."
+        case .obj: return "Revit 2024+, SketchUp, Blender, 3ds Max, Rhino. Photo-textured scans export as a zip with textures."
         case .usdz: return "iPhone Quick Look, Reality Composer, AR."
         case .roomPlanUSDZ: return "Apple's own parametric room model."
         case .glb: return "Web viewers, Blender, Unity, Unreal."
@@ -130,6 +130,10 @@ enum Exporter {
             parts = [(project.kind == .object ? "Object" : "Scan", mesh)]
         }
 
+        // Photo textures are used for OBJ/GLB/USDZ when the scan has them and full detail is chosen.
+        let textured: TexturedMesh? = options.simplify == 0 && !options.colorByClass
+            ? try? TexturedMesh(contentsOf: folder.appendingPathComponent(ProjectFile.textured)) : nil
+
         var section: [(SIMD2<Float>, SIMD2<Float>)] = []
         if project.kind == .space && (formats.contains(.dxfPlan) || formats.contains(.pdfPlan) || formats.contains(.pngPlan)) {
             progress("Cutting plan section…")
@@ -160,18 +164,36 @@ enum Exporter {
                 let drawing = PlanDrawing(plan: project.kind == .room ? plan : nil, section: section, title: project.name, units: options.displayUnits)
                 if format == .pdfPlan { try PlanImageExport.pdf(drawing, to: url) } else { try PlanImageExport.png(drawing, to: url) }
             case .obj:
+                if let textured, !textured.pages.isEmpty {
+                    progress("Writing textured OBJ…")
+                    let dir = outDir.appendingPathComponent(safeName + "-obj", isDirectory: true)
+                    try? fm.removeItem(at: dir)
+                    try MeshFormats.texturedOBJ(textured, textures: folder, name: safeName, in: dir)
+                    let zip = outDir.appendingPathComponent(safeName + "-obj.zip")
+                    try? fm.removeItem(at: zip)
+                    try zipFolder(dir, to: zip)
+                    try? fm.removeItem(at: dir)
+                    urls.append(zip)
+                    continue
+                }
                 try MeshFormats.obj(parts: parts, to: url)
             case .usdz:
                 let model = folder.appendingPathComponent(ProjectFile.model)
                 if project.kind == .object && fm.fileExists(atPath: model.path) {
                     try fm.copyItem(at: model, to: url)
+                } else if let textured, !textured.pages.isEmpty {
+                    try SceneExport.write(SceneExport.texturedScene(textured, folder: folder, dollhouse: false), to: url)
                 } else {
                     try SceneExport.usdz(parts: parts, to: url)
                 }
             case .roomPlanUSDZ:
                 try fm.copyItem(at: folder.appendingPathComponent(ProjectFile.roomUSDZ), to: url)
             case .glb:
-                try MeshFormats.glb(parts: parts, to: url)
+                if let textured, !textured.pages.isEmpty {
+                    try MeshFormats.texturedGLB(textured, textures: folder, to: url)
+                } else {
+                    try MeshFormats.glb(parts: parts, to: url)
+                }
             case .stl:
                 try MeshFormats.stl(mesh, floor: floor, to: url)
             case .ply:
@@ -187,6 +209,16 @@ enum Exporter {
             urls.append(url)
         }
         return urls
+    }
+
+    /// Zips a folder with the system's built-in archiver (the same one Files uses).
+    static func zipFolder(_ dir: URL, to zip: URL) throws {
+        var coordError: NSError?
+        var copyError: Error?
+        NSFileCoordinator().coordinate(readingItemAt: dir, options: .forUploading, error: &coordError) { tmp in
+            do { try FileManager.default.copyItem(at: tmp, to: zip) } catch { copyError = error }
+        }
+        if let e = coordError ?? (copyError as NSError?) { throw e }
     }
 
     static func csv(_ plan: PlanModel, units: UnitSystem) -> String {

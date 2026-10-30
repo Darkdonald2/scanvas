@@ -57,6 +57,38 @@ enum SceneExport {
         return scene
     }
 
+    /// Photo-textured scene; textures are `tex_<n>.jpg` in `folder`.
+    static func texturedScene(_ t: TexturedMesh, folder: URL, wireframe: Bool = false, dollhouse: Bool = true) -> SCNScene {
+        let scene = SCNScene()
+        var cull: SCNCullMode = .back
+        if let first = t.pages.first(where: { !$0.indices.isEmpty }) { cull = facesTowardNormals(first.asMesh) ? .back : .front }
+        for (i, page) in t.pages.enumerated() where !page.indices.isEmpty {
+            var sources = [SCNGeometrySource(vertices: page.positions.map { SCNVector3($0.x, $0.y, $0.z) })]
+            if page.normals.count == page.positions.count {
+                sources.append(SCNGeometrySource(normals: page.normals.map { SCNVector3($0.x, $0.y, $0.z) }))
+            }
+            sources.append(SCNGeometrySource(textureCoordinates: page.uvs.map { CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)) }))
+            let g = SCNGeometry(sources: sources, elements: [SCNGeometryElement(indices: page.indices, primitiveType: .triangles)])
+            let mat = SCNMaterial()
+            mat.diffuse.contents = folder.appendingPathComponent(TexturedMesh.textureName(i))
+            mat.diffuse.mipFilter = .linear
+            // The photos already contain the room's real lighting.
+            mat.lightingModel = .constant
+            mat.fillMode = wireframe ? .lines : .fill
+            if dollhouse && !wireframe { mat.isDoubleSided = false; mat.cullMode = cull } else { mat.isDoubleSided = true }
+            g.materials = [mat]
+            let node = SCNNode(geometry: g)
+            node.name = "Scan"
+            scene.rootNode.addChildNode(node)
+        }
+        if !t.untextured.isEmpty {
+            let node = SCNNode(geometry: geometry(t.untextured, wireframe: wireframe, dollhouse: dollhouse))
+            node.name = "Scan"
+            scene.rootNode.addChildNode(node)
+        }
+        return scene
+    }
+
     /// A room with one node per wall, so the viewer can hide the walls between the camera and the room.
     static func roomScene(_ plan: PlanModel, wireframe: Bool, recolour: ((String, MeshData) -> MeshData)? = nil) -> SCNScene {
         let scene = SCNScene()
@@ -86,7 +118,11 @@ enum SceneExport {
     }
 
     static func usdz(parts: [(String, MeshData)], to url: URL) throws {
-        let ok = scene(parts: parts).write(to: url, options: nil, delegate: nil, progressHandler: nil)
+        try write(scene(parts: parts), to: url)
+    }
+
+    static func write(_ scene: SCNScene, to url: URL) throws {
+        let ok = scene.write(to: url, options: nil, delegate: nil, progressHandler: nil)
         if !ok { throw CocoaError(.fileWriteUnknown) }
     }
 

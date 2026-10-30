@@ -39,6 +39,8 @@ enum ProjectFile {
     static let roomUSDZ = "roomplan.usdz"   // Apple's own parametric model
     static let mesh = "mesh.bin"            // MeshData (spaces, rooms, objects)
     static let model = "model.usdz"         // textured Object Capture model
+    static let textured = "textured.bin"    // TexturedMesh (photo-textured spaces) + tex_<n>.jpg
+    static let keyframes = "Keyframes"      // photos kept while scanning a space
     static let thumbnail = "thumb.jpg"
     static let images = "Images"            // Object Capture photos
     static let checkpoint = "Checkpoint"

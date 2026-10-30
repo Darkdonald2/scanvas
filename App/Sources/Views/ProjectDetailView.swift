@@ -14,6 +14,7 @@ struct ProjectDetailView: View {
     @State private var shading: Shading = .colour
     @State private var plan: PlanModel?
     @State private var mesh: MeshData?
+    @State private var textured: TexturedMesh?
     @State private var scene: SCNScene?
     @State private var section: [(SIMD2<Float>, SIMD2<Float>)] = []
     @State private var sectionHeight: Double = 1.2
@@ -177,7 +178,7 @@ struct ProjectDetailView: View {
     private func load() async {
         let folder = store.folder(for: project)
         let kind = project.kind
-        let result: (PlanModel?, MeshData?) = await Task.detached(priority: .userInitiated) {
+        let result: (PlanModel?, MeshData?, TexturedMesh?) = await Task.detached(priority: .userInitiated) {
             let plan = (try? Data(contentsOf: folder.appendingPathComponent(ProjectFile.plan)))
                 .flatMap { try? JSONDecoder().decode(PlanModel.self, from: $0) }
             var mesh: MeshData?
@@ -186,8 +187,10 @@ struct ProjectDetailView: View {
             } else {
                 mesh = try? MeshData(contentsOf: folder.appendingPathComponent(ProjectFile.mesh))
             }
-            return (plan, mesh)
+            let textured = try? TexturedMesh(contentsOf: folder.appendingPathComponent(ProjectFile.textured))
+            return (plan, mesh, textured)
         }.value
+        textured = result.2
         plan = result.0
         mesh = result.1
         if project.kind == .space, let m = result.1 { floorY = m.floorHeight }
@@ -205,6 +208,10 @@ struct ProjectDetailView: View {
         if let plan, project.kind == .room {
             scene = SceneExport.roomScene(plan, wireframe: shading == .wire,
                                           recolour: shading == .classes ? { recolour($1, name: $0) } : nil)
+            return
+        }
+        if shading == .colour, let textured {
+            scene = SceneExport.texturedScene(textured, folder: folder, wireframe: false, dollhouse: true)
             return
         }
         guard var m = mesh else { return }
