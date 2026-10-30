@@ -1,0 +1,7 @@
+Scanvas.xcodeproj/
+build/
+*.ipa
+App/Resources/Info.plist
+DerivedData/
+.DS_Store
+xcuserdata/

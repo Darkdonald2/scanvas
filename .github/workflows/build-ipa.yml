@@ -1,0 +1,27 @@
+# Builds an unsigned Scanvas.ipa on GitHub's Macs and publishes it on the "latest" release,
+# so it can be downloaded straight to an iPhone and opened in AltStore / SideStore.
+name: Build IPA
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: bash make-ipa.command
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Scanvas-ipa
+          path: Scanvas.ipa
+      - name: Publish to the "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest Scanvas.ipa --title "Scanvas (latest build)" \
+            --notes "Built from ${GITHUB_SHA::7}. Download Scanvas.ipa on your iPhone and open it in AltStore."
