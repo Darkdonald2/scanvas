@@ -4,45 +4,58 @@ import simd
 /// Turns a room plan into 3D meshes (walls with door/window holes, floor, doors, windows, furniture)
 /// in ARKit-style coordinates (Y up, floor at 0), so rooms can use every mesh format.
 enum PlanMesher {
+    static let wallColor = SIMD3<UInt8>(232, 228, 220), floorColor = SIMD3<UInt8>(168, 128, 92)
+    static let doorColor = SIMD3<UInt8>(140, 90, 60), glassColor = SIMD3<UInt8>(140, 200, 235)
+
     static func parts(_ plan: PlanModel) -> [(String, MeshData)] {
         var walls = MeshData(), floor = MeshData(), doors = MeshData(), windows = MeshData(), furniture = MeshData()
-        let wallColor = SIMD3<UInt8>(232, 228, 220), floorColor = SIMD3<UInt8>(168, 128, 92)
-        let doorColor = SIMD3<UInt8>(140, 90, 60), glassColor = SIMD3<UInt8>(140, 200, 235)
-
         for wall in plan.walls {
-            let t = max(wall.size.y, plan.wallThickness)
-            let H = wall.size.z
-            func piece(_ from: Float, _ to: Float, _ z0: Float, _ z1: Float) {
-                guard to - from > 0.001, z1 - z0 > 0.001 else { return }
-                let c = wall.center2D + wall.axis * ((from + to) / 2)
-                walls.append(box(center: SIMD3(c, wall.bottom + (z0 + z1) / 2), yaw: wall.yaw,
-                                 size: SIMD3(to - from, t, z1 - z0), color: wallColor))
-            }
-            for (s, e) in plan.solidSpans(of: wall) { piece(s, e, 0, H) }
-            for g in plan.gaps(in: wall) {
-                piece(g.from, g.to, 0, g.bottom)          // sill
-                piece(g.from, g.to, g.top, H)             // lintel
-                let w = g.to - g.from, h = g.top - g.bottom
-                let c = wall.center2D + wall.axis * ((g.from + g.to) / 2)
-                let center = SIMD3(c, wall.bottom + (g.bottom + g.top) / 2)
-                switch g.element.kind {
-                case .door: doors.append(box(center: center, yaw: wall.yaw, size: SIMD3(w, 0.04, h), color: doorColor))
-                case .window: windows.append(box(center: center, yaw: wall.yaw, size: SIMD3(w, 0.02, h), color: glassColor))
-                default: break
-                }
+            let w = wallParts(wall, plan: plan)
+            walls.append(w.wall); doors.append(w.doors); windows.append(w.windows)
+        }
+        floor = floorMesh(plan)
+        for obj in plan.objects { furniture.append(objectMesh(obj)) }
+        return [("Walls", walls), ("Floor", floor), ("Doors", doors), ("Windows", windows), ("Furniture", furniture)]
+            .filter { !$0.1.isEmpty }
+    }
+
+    /// One wall with its door/window holes, plus the doors and windows that sit in it.
+    static func wallParts(_ wall: PlanElement, plan: PlanModel) -> (wall: MeshData, doors: MeshData, windows: MeshData) {
+        var walls = MeshData(), doors = MeshData(), windows = MeshData()
+        let t = max(wall.size.y, plan.wallThickness)
+        let H = wall.size.z
+        func piece(_ from: Float, _ to: Float, _ z0: Float, _ z1: Float) {
+            guard to - from > 0.001, z1 - z0 > 0.001 else { return }
+            let c = wall.center2D + wall.axis * ((from + to) / 2)
+            walls.append(box(center: SIMD3(c, wall.bottom + (z0 + z1) / 2), yaw: wall.yaw,
+                             size: SIMD3(to - from, t, z1 - z0), color: wallColor))
+        }
+        for (s, e) in plan.solidSpans(of: wall) { piece(s, e, 0, H) }
+        for g in plan.gaps(in: wall) {
+            piece(g.from, g.to, 0, g.bottom)          // sill
+            piece(g.from, g.to, g.top, H)             // lintel
+            let w = g.to - g.from, h = g.top - g.bottom
+            let c = wall.center2D + wall.axis * ((g.from + g.to) / 2)
+            let center = SIMD3(c, wall.bottom + (g.bottom + g.top) / 2)
+            switch g.element.kind {
+            case .door: doors.append(box(center: center, yaw: wall.yaw, size: SIMD3(w, 0.04, h), color: doorColor))
+            case .window: windows.append(box(center: center, yaw: wall.yaw, size: SIMD3(w, 0.02, h), color: glassColor))
+            default: break
             }
         }
+        return (walls, doors, windows)
+    }
 
+    static func floorMesh(_ plan: PlanModel) -> MeshData {
+        var floor = MeshData()
         for outline in plan.outlines where outline.count >= 3 {
             floor.append(prism(outline, bottom: -0.02, top: 0, color: floorColor))
         }
+        return floor
+    }
 
-        for obj in plan.objects {
-            furniture.append(box(center: obj.center, yaw: obj.yaw, size: obj.size, color: color(for: obj.label)))
-        }
-
-        return [("Walls", walls), ("Floor", floor), ("Doors", doors), ("Windows", windows), ("Furniture", furniture)]
-            .filter { !$0.1.isEmpty }
+    static func objectMesh(_ obj: PlanElement) -> MeshData {
+        box(center: obj.center, yaw: obj.yaw, size: obj.size, color: color(for: obj.label))
     }
 
     static func combined(_ plan: PlanModel) -> MeshData {

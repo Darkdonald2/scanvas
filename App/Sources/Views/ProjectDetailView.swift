@@ -17,6 +17,10 @@ struct ProjectDetailView: View {
     @State private var scene: SCNScene?
     @State private var section: [(SIMD2<Float>, SIMD2<Float>)] = []
     @State private var sectionHeight: Double = 1.2
+    @State private var viewMode: ViewMode = .inside
+    @State private var floorY: Float = 0
+    @State private var move: SIMD2<Float> = .zero
+    @State private var resetToken = 0
     @State private var measuring = false
     @State private var measured: Float?
     @State private var showExport = false
@@ -38,7 +42,8 @@ struct ProjectDetailView: View {
                 if loading {
                     ProgressView("Loading…").frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if tab == .model, let scene {
-                    SceneViewer(scene: scene, measuring: measuring) { measured = $0 }
+                    SceneViewer(scene: scene, mode: project.kind == .object ? .outside : viewMode, floorY: floorY,
+                                measuring: measuring, move: move, resetToken: resetToken) { measured = $0 }
                     modelOverlay
                 } else if tab == .plan {
                     FloorPlanView(drawing: PlanDrawing(plan: project.kind == .room ? plan : nil, section: section, title: current.name, units: units))
@@ -82,6 +87,24 @@ struct ProjectDetailView: View {
 
     private var modelOverlay: some View {
         VStack(spacing: 8) {
+            if project.kind != .object {
+                HStack {
+                    Picker("View", selection: $viewMode) {
+                        ForEach(ViewMode.allCases, id: \.self) { Text($0.rawValue) }
+                    }
+                    .pickerStyle(.segmented).frame(maxWidth: 200)
+                    Button { resetToken += 1 } label: {
+                        Image(systemName: "arrow.counterclockwise").padding(8).background(Color(white: 0.2), in: Circle())
+                    }
+                    .foregroundStyle(.white)
+                }
+                Text(viewMode == .inside ? "Drag to look around · joystick to walk · pinch to zoom" : "Drag to orbit · walls nearest you turn see-through")
+                    .font(.caption2).foregroundStyle(.secondary)
+                Spacer()
+                if viewMode == .inside {
+                    HStack { Joystick(value: $move); Spacer() }
+                }
+            }
             if measuring {
                 Text(measured.map { "Distance: " + units.length($0) } ?? "Tap two points on the model")
                     .font(.callout.weight(.semibold))
@@ -167,6 +190,8 @@ struct ProjectDetailView: View {
         }.value
         plan = result.0
         mesh = result.1
+        if project.kind == .space, let m = result.1 { floorY = m.floorHeight }
+        if project.kind == .object { viewMode = .outside }
         rebuildScene()
         loading = false
     }
@@ -178,16 +203,15 @@ struct ProjectDetailView: View {
             return
         }
         if let plan, project.kind == .room {
-            var parts = PlanMesher.parts(plan)
-            if shading == .classes { parts = parts.map { ($0.0, recolour($0.1, name: $0.0)) } }
-            scene = SceneExport.scene(parts: parts, wireframe: shading == .wire)
+            scene = SceneExport.roomScene(plan, wireframe: shading == .wire,
+                                          recolour: shading == .classes ? { recolour($1, name: $0) } : nil)
             return
         }
         guard var m = mesh else { return }
         // Keep the viewer smooth on very large scans; exports always use full detail.
         if m.triangleCount > 1_500_000 { m = m.simplified(cell: 0.03) }
         if shading == .classes { m = m.colouredByClass() }
-        scene = SceneExport.scene(parts: [("Scan", m)], wireframe: shading == .wire)
+        scene = SceneExport.scene(parts: [("Scan", m)], wireframe: shading == .wire, dollhouse: true)
     }
 
     private func recolour(_ m: MeshData, name: String) -> MeshData {
