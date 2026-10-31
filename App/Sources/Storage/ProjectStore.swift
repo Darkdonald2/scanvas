@@ -27,7 +27,15 @@ final class ProjectStore: ObservableObject {
     func reload() {
         let fm = FileManager.default
         try? fm.createDirectory(at: Self.scansRoot, withIntermediateDirectories: true)
-        let dirs = (try? fm.contentsOfDirectory(at: Self.scansRoot, includingPropertiesForKeys: nil)) ?? []
+        var dirs = (try? fm.contentsOfDirectory(at: Self.scansRoot, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        // Clean up leftovers of scans that never finished saving (app closed mid-processing, failed save).
+        dirs.removeAll { dir in
+            guard !fm.fileExists(atPath: dir.appendingPathComponent(ProjectFile.info).path) else { return false }
+            let modified = (try? dir.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            guard Date().timeIntervalSince(modified) > 3600 else { return false }
+            try? fm.removeItem(at: dir)
+            return true
+        }
         projects = dirs.compactMap { dir in
             guard let data = try? Data(contentsOf: dir.appendingPathComponent(ProjectFile.info)) else { return nil }
             return try? JSONDecoder().decode(ScanProject.self, from: data)
