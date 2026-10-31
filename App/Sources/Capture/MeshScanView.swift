@@ -38,6 +38,12 @@ struct MeshScanView: View {
                     .padding(.horizontal, 10).padding(.vertical, 6)
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
                 }
+                if scanner.tooFast {
+                    Label("Slow down", systemImage: "tortoise.fill").font(.title3.bold())
+                        .padding(.horizontal, 18).padding(.vertical, 10)
+                        .background(.red.opacity(0.9), in: Capsule())
+                        .transition(.scale.combined(with: .opacity))
+                }
                 if let msg = scanner.trackingMessage {
                     Text(msg).font(.callout.weight(.semibold))
                         .padding(.horizontal, 14).padding(.vertical, 8)
@@ -78,6 +84,10 @@ struct MeshScanView: View {
             scanner.start()
         }
         .onDisappear { scanner.stop() }
+        .animation(.easeInOut(duration: 0.2), value: scanner.tooFast)
+        .onChange(of: scanner.tooFast) { _, fast in
+            if fast { UINotificationFeedbackGenerator().notificationOccurred(.warning) }
+        }
         .alert("Could not save", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
             Button("OK", role: .cancel) {}
         } message: { Text(errorMessage ?? "") }

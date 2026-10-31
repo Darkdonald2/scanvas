@@ -24,36 +24,51 @@ enum Texturer {
         let meanSharpness = frames.reduce(0) { $0 + $1.sharpness } / Float(frames.count)
         let sharpWeight = frames.map { min(1.5, max(0.4, ($0.sharpness / max(meanSharpness, 1)).squareRoot())) }
 
-        /// Score of seeing triangle t in frame f (0 = not usable), and its three photo pixel positions.
+        /// True when the point at camera depth `z`, seen at keyframe pixel (u, v), is really what the photo shows:
+        /// nothing nearer is in front of it (checked over a 3×3 patch) and the surface is actually there.
+        func visible(_ f: Keyframe, _ u: Float, _ v: Float, _ z: Float) -> Bool {
+            guard !f.depth.isEmpty else { return true }
+            let ui = Int(u), vi = Int(v)
+            guard ui >= 1, vi >= 1, ui < dw - 1, vi < dh - 1 else { return true }
+            let tol = 0.03 + 0.02 * z
+            var nearest: Float = .greatestFiniteMagnitude
+            for dy in -1...1 {
+                for dx in -1...1 {
+                    let d = f.depth[(vi + dy) * dw + ui + dx]
+                    if d > 0 { nearest = min(nearest, d) }
+                }
+            }
+            if nearest < .greatestFiniteMagnitude && z - nearest > tol { return false }   // something in front
+            let d = f.depth[vi * dw + ui]
+            if d > 0 && d - z > 0.08 + 0.04 * z { return false }                          // surface not where the mesh says
+            return true
+        }
+
+        /// Score of seeing triangle t in photo fi (0 = not usable).
         func score(_ t: Int, _ fi: Int) -> Float {
             let f = frames[fi]
             let a = mesh.positions[Int(mesh.indices[3 * t])], b = mesh.positions[Int(mesh.indices[3 * t + 1])], c = mesh.positions[Int(mesh.indices[3 * t + 2])]
-            var zs = SIMD3<Float>()
-            for (i, p) in [a, b, c].enumerated() {
+            let centre = (a + b + c) / 3
+            let n = mesh.faceNormal(t) * flip
+            let toCam = f.cameraPosition - centre
+            let dist = simd_length(toCam)
+            let facing = simd_dot(n, toCam / max(dist, 0.001))
+            // Grazing views smear pixels across the surface; only fairly head-on photos are used.
+            guard facing > 0.4 else { return 0 }
+            for p in [a, b, c, centre] {
                 let q = f.worldToCamera * SIMD4(p, 1)
                 let z = -q.z
                 guard z > 0.15 else { return 0 }
-                let u = (f.fx * q.x / z + f.cx) * k, v = (f.cy - f.fy * q.y / z) * k
-                guard u > 3, v > 3, u < W - 3, v < H - 3 else { return 0 }
-                zs[i] = z
+                let u = f.fx * q.x / z + f.cx, v = f.cy - f.fy * q.y / z
+                guard u * k > 3, v * k > 3, u * k < W - 3, v * k < H - 3 else { return 0 }
+                if !visible(f, u, v, z) { return 0 }
             }
-            let centre = (a + b + c) / 3
             let qc = f.worldToCamera * SIMD4(centre, 1)
             let zc = -qc.z
-            if !f.depth.isEmpty {
-                let ui = Int(f.fx * qc.x / zc + f.cx), vi = Int(f.cy - f.fy * qc.y / zc)
-                if ui >= 0, vi >= 0, ui < dw, vi < dh {
-                    let d = f.depth[vi * dw + ui]
-                    if d > 0 && abs(d - zc) > 0.05 + 0.03 * zc { return 0 }
-                }
-            }
-            let n = mesh.faceNormal(t) * flip
-            let facing = simd_dot(n, simd_normalize(f.cameraPosition - centre))
-            guard facing > 0.2 else { return 0 }
-            // Head-on and close wins; a view near the image centre is a little sharper.
             let u = (f.fx * qc.x / zc + f.cx) / Float(dw) - 0.5, v = (f.cy - f.fy * qc.y / zc) / Float(dh) - 0.5
-            let centred = 1 - 0.4 * (u * u + v * v)
-            return facing * facing * centred * sharpWeight[fi] / (0.3 + zc)
+            let centred = 1 - 0.6 * (u * u + v * v)
+            // Head-on, close and sharp wins.
+            return facing * facing * facing * centred * sharpWeight[fi] / ((0.3 + zc) * (0.3 + zc))
         }
 
         // Pass 1: best view per triangle, counted as votes per photo.
@@ -89,7 +104,7 @@ enum Texturer {
                     var bs: Float = 0, bi = best[t]
                     for fi in frames.indices where votes[fi] > 0 {
                         let s = score(t, fi)
-                        guard s > bestScore[t] * 0.7 else { continue }
+                        guard s > bestScore[t] * 0.6 else { continue }
                         let w = s * (0.6 + 0.4 * Float(votes[fi]) / maxVotes)
                         if w > bs { bs = w; bi = Int32(fi) }
                     }
@@ -114,12 +129,12 @@ enum Texturer {
             adjacency[Int(tris[0])].append(tris[1]); adjacency[Int(tris[1])].append(tris[0])
         }
         edgeTris = [:]
-        for _ in 0..<4 {
+        for _ in 0..<8 {
             for t in 0..<triCount where choice[t] >= 0 && !adjacency[t].isEmpty {
                 var counts: [Int32: Int] = [:]
                 for nb in adjacency[Int(t)] where choice[Int(nb)] >= 0 { counts[choice[Int(nb)], default: 0] += 1 }
                 guard let top = counts.max(by: { $0.value < $1.value }), top.key != choice[t], top.value >= 2 else { continue }
-                if score(t, Int(top.key)) >= bestScore[t] * 0.45 { choice[t] = top.key }
+                if score(t, Int(top.key)) >= bestScore[t] * 0.35 { choice[t] = top.key }
             }
         }
 

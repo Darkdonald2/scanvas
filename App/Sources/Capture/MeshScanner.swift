@@ -28,6 +28,8 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
     @Published var isScanning = false
     @Published var keyframeCount = 0
     @Published var elapsed: TimeInterval = 0
+    /// True while the phone moves or turns too fast for sharp photos.
+    @Published var tooFast = false
 
     let arView: ARView
     var captureColour = true
@@ -47,6 +49,10 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
     private var meshAnchors: [UUID: ARMeshAnchor] = [:]
     private let anchorLock = NSLock()
     private var sharpnessMean: Float = 0
+    private var motionPose: simd_float4x4?
+    private var motionTime: TimeInterval = 0
+    private var linearSpeed: Float = 0, angularSpeed: Float = 0
+    private var fastSince: TimeInterval?, slowSince: TimeInterval?
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let photoQueue = DispatchQueue(label: "scanvas.photos", qos: .utility)
 
@@ -95,11 +101,29 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
         anchorLock.unlock()
     }
 
+    /// Smoothed walking and turning speed; flags "too fast" after it lasts a moment, clears after it calms down.
+    private func trackSpeed(_ t: simd_float4x4, _ now: TimeInterval) {
+        defer { motionPose = t; motionTime = now }
+        guard isScanning, let last = motionPose, now > motionTime else { return }
+        let dt = Float(now - motionTime)
+        let moved = simd_distance(SIMD3(t.columns.3.x, t.columns.3.y, t.columns.3.z), SIMD3(last.columns.3.x, last.columns.3.y, last.columns.3.z))
+        let f0 = SIMD3(last.columns.2.x, last.columns.2.y, last.columns.2.z), f1 = SIMD3(t.columns.2.x, t.columns.2.y, t.columns.2.z)
+        let turned = acos(min(1, max(-1, simd_dot(f0, f1))))
+        linearSpeed = linearSpeed * 0.85 + (moved / dt) * 0.15
+        angularSpeed = angularSpeed * 0.85 + (turned / dt) * 0.15
+        let fast = linearSpeed > 0.55 || angularSpeed > 0.9      // ~0.55 m/s or ~50°/s
+        if fast { slowSince = nil; if fastSince == nil { fastSince = now } } else { fastSince = nil; if slowSince == nil { slowSince = now } }
+        let warn: Bool
+        if tooFast { warn = !(slowSince.map { now - $0 > 0.6 } ?? false) } else { warn = fastSince.map { now - $0 > 0.25 } ?? false }
+        if warn != tooFast { DispatchQueue.main.async { self.tooFast = warn } }
+    }
+
     /// Ask ARKit to find its old position after an interruption, so new mesh lines up with the old.
     func sessionShouldAttemptRelocalization(_ session: ARSession) -> Bool { true }
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let now = frame.timestamp
+        trackSpeed(frame.camera.transform, now)
         if now - lastStatsTime > 0.5 {
             lastStatsTime = now
             anchorLock.lock()
