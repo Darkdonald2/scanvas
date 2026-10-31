@@ -224,7 +224,7 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
     /// ARKit keeps refining where mesh anchors sit as it learns the space. Photos taken early were placed
     /// against the old positions, so move each photo's camera by how much the anchor it was looking at moved since.
     func correctedKeyframes() -> [Keyframe] {
-        let frames = correctedKeyframes()
+        lock.lock(); let frames = keyframes; lock.unlock()
         anchorLock.lock(); let now = meshAnchors.mapValues { $0.transform }; anchorLock.unlock()
         return frames.map { kf in
             var kf = kf
