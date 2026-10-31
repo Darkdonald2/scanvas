@@ -42,6 +42,10 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
     /// Where sharp photos are written while scanning (nil = colour only).
     var photoDirectory: URL?
     private var photoCount = 0
+    /// Every mesh anchor seen so far. Kept here so the scan survives the app being paused
+    /// (screenshot, notification, app switcher), when ARKit can drop anchors from the session.
+    private var meshAnchors: [UUID: ARMeshAnchor] = [:]
+    private let anchorLock = NSLock()
     private var sharpnessMean: Float = 0
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let photoQueue = DispatchQueue(label: "scanvas.photos", qos: .utility)
@@ -81,11 +85,26 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
 
     // MARK: ARSessionDelegate
 
+    func session(_ session: ARSession, didAdd anchors: [ARAnchor]) { remember(anchors) }
+    func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) { remember(anchors) }
+
+    private func remember(_ anchors: [ARAnchor]) {
+        guard isScanning else { return }
+        anchorLock.lock()
+        for case let a as ARMeshAnchor in anchors { meshAnchors[a.identifier] = a }
+        anchorLock.unlock()
+    }
+
+    /// Ask ARKit to find its old position after an interruption, so new mesh lines up with the old.
+    func sessionShouldAttemptRelocalization(_ session: ARSession) -> Bool { true }
+
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let now = frame.timestamp
         if now - lastStatsTime > 0.5 {
             lastStatsTime = now
-            let tris = frame.anchors.reduce(0) { $0 + (($1 as? ARMeshAnchor)?.geometry.faces.count ?? 0) }
+            anchorLock.lock()
+            let tris = meshAnchors.values.reduce(0) { $0 + $1.geometry.faces.count }
+            anchorLock.unlock()
             let message = Self.message(for: frame.camera.trackingState)
             let kf = keyframes.count
             DispatchQueue.main.async {
@@ -224,7 +243,12 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
 
     /// Collects every mesh anchor into one world-space mesh.
     func collectMesh() -> MeshData {
-        let anchors = arView.session.currentFrame?.anchors.compactMap { $0 as? ARMeshAnchor } ?? []
+        // Latest copy of every anchor: from the live session when it has them, else the ones we kept.
+        anchorLock.lock()
+        var byID = meshAnchors
+        anchorLock.unlock()
+        for case let a as ARMeshAnchor in arView.session.currentFrame?.anchors ?? [] { byID[a.identifier] = a }
+        let anchors = Array(byID.values)
         var mesh = MeshData()
         for a in anchors { mesh.append(Self.meshData(from: a)) }
         return mesh

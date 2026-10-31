@@ -92,6 +92,11 @@ struct MeshScanView: View {
         saving = true
         status = "Collecting mesh…"
         let collected = scanner.collectMesh()
+        if collected.isEmpty {
+            saving = false
+            errorMessage = "No mesh was captured yet. Keep scanning for a few seconds, then tap Finish again."
+            return
+        }
         scanner.stop()
         let project = self.project
         let colour = captureColour
