@@ -14,6 +14,8 @@ struct SceneViewer: UIViewRepresentable {
     var measuring: Bool
     /// Joystick: x = strafe right, y = forward, each −1…1.
     var move: SIMD2<Float> = .zero
+    /// Up/down: +1 rises, −1 sinks.
+    var lift: Float = 0
     var resetToken = 0
     var onMeasure: (Float?) -> Void
 
@@ -138,10 +140,10 @@ struct SceneViewer: UIViewRepresentable {
         func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
             let dt = Float(lastTime == 0 ? 0 : min(0.1, time - lastTime))
             lastTime = time
-            let mode = parent.mode, move = parent.move
-            if mode == .inside && simd_length(move) > 0.05 {
+            let mode = parent.mode, move = parent.move, lift = parent.lift
+            if mode == .inside && (simd_length(move) > 0.05 || lift != 0) {
                 let forward = SIMD3<Float>(-sin(yaw), 0, -cos(yaw)), right = SIMD3<Float>(cos(yaw), 0, -sin(yaw))
-                camera.simdPosition += (forward * move.y + right * move.x) * 1.4 * dt
+                camera.simdPosition += (forward * move.y + right * move.x) * 1.4 * dt + SIMD3(0, lift * 0.9 * dt, 0)
             }
             guard let scene = renderer.scene, let pov = renderer.pointOfView else { return }
             let eye = pov.presentation.simdWorldPosition
@@ -219,5 +221,23 @@ struct Joystick: View {
                 withAnimation(.spring(duration: 0.2)) { knob = .zero }
                 value = .zero
             })
+    }
+}
+
+/// Press-and-hold button for rising or sinking in the inside view.
+struct HoldButton: View {
+    var systemImage: String
+    var onChange: (Bool) -> Void
+    @State private var pressed = false
+
+    var body: some View {
+        Image(systemName: systemImage)
+            .font(.title2.bold())
+            .frame(width: 56, height: 56)
+            .background(pressed ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.ultraThinMaterial), in: Circle())
+            .foregroundStyle(pressed ? .black : .white)
+            .gesture(DragGesture(minimumDistance: 0)
+                .onChanged { _ in if !pressed { pressed = true; onChange(true) } }
+                .onEnded { _ in pressed = false; onChange(false) })
     }
 }

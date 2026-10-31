@@ -15,6 +15,7 @@ struct MeshScanView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("captureColour") private var captureColour = true
     @AppStorage("smoothMesh") private var smoothMesh = true
+    @AppStorage("lockExposure") private var lockExposure = true
     @State private var saving = false
     @State private var status = ""
     @State private var errorMessage: String?
@@ -75,6 +76,7 @@ struct MeshScanView: View {
         }
         .onAppear {
             scanner.captureColour = captureColour
+            scanner.lockExposure = lockExposure
             project.name = store.nextName(for: .space)
             if captureColour {
                 let photos = ProjectStore.folder(for: project.id).appendingPathComponent(ProjectFile.keyframes, isDirectory: true)

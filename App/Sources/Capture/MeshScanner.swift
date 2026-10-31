@@ -1,6 +1,7 @@
 import ARKit
 import RealityKit
 import CoreImage
+import AVFoundation
 import UIKit
 import simd
 
@@ -14,6 +15,8 @@ struct Keyframe {
     var fx: Float, fy: Float, cx: Float, cy: Float
     /// Index of the sharp photo saved for this keyframe (`photo_<n>.jpg`), or −1.
     var photo = -1
+    /// Mesh-anchor transforms when the photo was taken, to undo ARKit drift corrections later.
+    var anchorTransforms: [UUID: simd_float4x4] = [:]
     /// Image sharpness (variance of the Laplacian); low means motion blur.
     var sharpness: Float = 1
 
@@ -44,6 +47,10 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
     /// Where sharp photos are written while scanning (nil = colour only).
     var photoDirectory: URL?
     private var photoCount = 0
+    /// Lock exposure and white balance once tracking settles, so every photo has the same brightness and colour.
+    var lockExposure = true
+    private var exposureLocked = false
+    private var normalSince: TimeInterval?
     /// Every mesh anchor seen so far. Kept here so the scan survives the app being paused
     /// (screenshot, notification, app switcher), when ARKit can drop anchors from the session.
     private var meshAnchors: [UUID: ARMeshAnchor] = [:]
@@ -86,7 +93,24 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
 
     func stop() {
         isScanning = false
+        setExposureLock(false)
         arView.session.pause()
+    }
+
+    private func setExposureLock(_ on: Bool) {
+        guard on != exposureLocked, let device = ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera else { return }
+        do {
+            try device.lockForConfiguration()
+            if on {
+                if device.isExposureModeSupported(.locked) { device.exposureMode = .locked }
+                if device.isWhiteBalanceModeSupported(.locked) { device.whiteBalanceMode = .locked }
+            } else {
+                if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+                if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
+            }
+            device.unlockForConfiguration()
+            exposureLocked = on
+        } catch {}
     }
 
     // MARK: ARSessionDelegate
@@ -124,6 +148,14 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let now = frame.timestamp
         trackSpeed(frame.camera.transform, now)
+        if lockExposure && !exposureLocked && isScanning {
+            if case .normal = frame.camera.trackingState {
+                if normalSince == nil { normalSince = now }
+                if now - (normalSince ?? now) > 1.5 { setExposureLock(true) }
+            } else {
+                normalSince = nil
+            }
+        }
         if now - lastStatsTime > 0.5 {
             lastStatsTime = now
             anchorLock.lock()
@@ -148,6 +180,9 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
             guard now - lastKeyTime > 0.2, moved > 0.1 || turned > 0.1 else { return }
         }
         guard var kf = Self.makeKeyframe(frame) else { return }
+        anchorLock.lock()
+        kf.anchorTransforms = meshAnchors.mapValues { $0.transform }
+        anchorLock.unlock()
         // Skip motion-blurred frames unless it has been a while since the last photo.
         if sharpnessMean > 0 && kf.sharpness < sharpnessMean * 0.6 && now - lastKeyTime < 1.5 { return }
         sharpnessMean = sharpnessMean == 0 ? kf.sharpness : sharpnessMean * 0.9 + kf.sharpness * 0.1
@@ -180,11 +215,36 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
         return ciContext.createCGImage(scaled, from: CGRect(x: 0, y: 0, width: Keyframe.photoWidth, height: Keyframe.photoHeight))
     }
 
-    /// Waits for pending photo writes and returns the keyframes that have photos.
+    /// Waits for pending photo writes and returns the keyframes that have photos, drift-corrected.
     func photoKeyframes() -> [Keyframe] {
         photoQueue.sync {}
-        lock.lock(); defer { lock.unlock() }
-        return keyframes.filter { $0.photo >= 0 }
+        return correctedKeyframes().filter { $0.photo >= 0 }
+    }
+
+    /// ARKit keeps refining where mesh anchors sit as it learns the space. Photos taken early were placed
+    /// against the old positions, so move each photo's camera by how much the anchor it was looking at moved since.
+    func correctedKeyframes() -> [Keyframe] {
+        let frames = correctedKeyframes()
+        anchorLock.lock(); let now = meshAnchors.mapValues { $0.transform }; anchorLock.unlock()
+        return frames.map { kf in
+            var kf = kf
+            let camera = kf.worldToCamera.inverse
+            let forward = -SIMD3(camera.columns.2.x, camera.columns.2.y, camera.columns.2.z)
+            let target = kf.cameraPosition + forward * 1.5
+            var best: (UUID, Float)?
+            for id in kf.anchorTransforms.keys {
+                guard let current = now[id] else { continue }
+                let d = simd_distance(SIMD3(current.columns.3.x, current.columns.3.y, current.columns.3.z), target)
+                if best == nil || d < best!.1 { best = (id, d) }
+            }
+            guard let id = best?.0, let then = kf.anchorTransforms[id], let current = now[id] else { return kf }
+            let correction = current * then.inverse
+            let corrected = correction * camera
+            kf.worldToCamera = corrected.inverse
+            kf.cameraPosition = SIMD3(corrected.columns.3.x, corrected.columns.3.y, corrected.columns.3.z)
+            kf.anchorTransforms = [:]
+            return kf
+        }
     }
 
     static func message(for state: ARCamera.TrackingState) -> String? {
@@ -319,7 +379,7 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
 
     /// Colours each vertex from the keyframes that saw it best (visible in depth, facing the camera, closest).
     func colourize(_ mesh: inout MeshData, progress: (Double) -> Void) {
-        lock.lock(); let frames = keyframes; lock.unlock()
+        let frames = correctedKeyframes()
         guard !frames.isEmpty else { return }
         let w = Keyframe.width, h = Keyframe.height
         var colors = [SIMD3<UInt8>](repeating: SIMD3(170, 170, 170), count: mesh.vertexCount)

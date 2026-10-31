@@ -21,6 +21,7 @@ struct ProjectDetailView: View {
     @State private var viewMode: ViewMode = .inside
     @State private var floorY: Float = 0
     @State private var move: SIMD2<Float> = .zero
+    @State private var lift: Float = 0
     @State private var resetToken = 0
     @State private var measuring = false
     @State private var measured: Float?
@@ -44,7 +45,7 @@ struct ProjectDetailView: View {
                     ProgressView("Loading…").frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if tab == .model, let scene {
                     SceneViewer(scene: scene, mode: project.kind == .object ? .outside : viewMode, floorY: floorY,
-                                measuring: measuring, move: move, resetToken: resetToken) { measured = $0 }
+                                measuring: measuring, move: move, lift: lift, resetToken: resetToken) { measured = $0 }
                     modelOverlay
                 } else if tab == .plan {
                     FloorPlanView(drawing: PlanDrawing(plan: project.kind == .room ? plan : nil, section: section, title: current.name, units: units))
@@ -99,11 +100,18 @@ struct ProjectDetailView: View {
                     }
                     .foregroundStyle(.white)
                 }
-                Text(viewMode == .inside ? "Drag to look around · joystick to walk · pinch to zoom" : "Drag to orbit · walls nearest you turn see-through")
+                Text(viewMode == .inside ? "Drag to look · joystick to walk · hold ↑ ↓ to rise or sink" : "Drag to orbit · walls nearest you turn see-through")
                     .font(.caption2).foregroundStyle(.secondary)
                 Spacer()
                 if viewMode == .inside {
-                    HStack { Joystick(value: $move); Spacer() }
+                    HStack(alignment: .bottom) {
+                        Joystick(value: $move)
+                        Spacer()
+                        VStack(spacing: 12) {
+                            HoldButton(systemImage: "arrow.up") { lift = $0 ? 1 : 0 }
+                            HoldButton(systemImage: "arrow.down") { lift = $0 ? -1 : 0 }
+                        }
+                    }
                 }
             }
             if measuring {

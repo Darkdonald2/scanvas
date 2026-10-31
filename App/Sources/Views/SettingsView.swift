@@ -7,6 +7,7 @@ struct SettingsView: View {
     @AppStorage("wallThickness") private var wallThickness = 0.12
     @AppStorage("captureColour") private var captureColour = true
     @AppStorage("smoothMesh") private var smoothMesh = true
+    @AppStorage("lockExposure") private var lockExposure = true
 
     var body: some View {
         NavigationStack {
@@ -29,8 +30,9 @@ struct SettingsView: View {
                 Section {
                     Toggle("Photo textures", isOn: $captureColour)
                     Toggle("Smooth mesh", isOn: $smoothMesh)
+                    Toggle("Lock exposure while scanning", isOn: $lockExposure)
                 } header: { Text("Space scans") } footer: {
-                    Text("Photo textures: takes photos while you scan and wraps the mesh in them afterwards. Smooth mesh: removes LiDAR bumps and noise. Turn photo textures off for very long scans to save memory.")
+                    Text("Photo textures: takes photos while you scan and wraps the mesh in them afterwards. Smooth mesh: removes LiDAR bumps and noise. Lock exposure: keeps brightness and colour the same in every photo so walls don't look patchy; turn it off if you walk between very bright and very dark areas. Turn photo textures off for very long scans to save memory.")
                 }
                 Section("About") {
                     LabeledContent("Version", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")

@@ -45,7 +45,7 @@ enum Texturer {
         }
 
         /// Score of seeing triangle t in photo fi (0 = not usable).
-        func score(_ t: Int, _ fi: Int) -> Float {
+        func score(_ t: Int, _ fi: Int, relaxed: Bool = false) -> Float {
             let f = frames[fi]
             let a = mesh.positions[Int(mesh.indices[3 * t])], b = mesh.positions[Int(mesh.indices[3 * t + 1])], c = mesh.positions[Int(mesh.indices[3 * t + 2])]
             let centre = (a + b + c) / 3
@@ -54,14 +54,14 @@ enum Texturer {
             let dist = simd_length(toCam)
             let facing = simd_dot(n, toCam / max(dist, 0.001))
             // Grazing views smear pixels across the surface; only fairly head-on photos are used.
-            guard facing > 0.4 else { return 0 }
-            for p in [a, b, c, centre] {
+            guard facing > (relaxed ? 0.12 : 0.4) else { return 0 }
+            for (i, p) in [a, b, c, centre].enumerated() {
                 let q = f.worldToCamera * SIMD4(p, 1)
                 let z = -q.z
                 guard z > 0.15 else { return 0 }
                 let u = f.fx * q.x / z + f.cx, v = f.cy - f.fy * q.y / z
                 guard u * k > 3, v * k > 3, u * k < W - 3, v * k < H - 3 else { return 0 }
-                if !visible(f, u, v, z) { return 0 }
+                if (!relaxed || i == 3) && !visible(f, u, v, z) { return 0 }
             }
             let qc = f.worldToCamera * SIMD4(centre, 1)
             let zc = -qc.z
@@ -135,6 +135,20 @@ enum Texturer {
                 for nb in adjacency[Int(t)] where choice[Int(nb)] >= 0 { counts[choice[Int(nb)], default: 0] += 1 }
                 guard let top = counts.max(by: { $0.value < $1.value }), top.key != choice[t], top.value >= 2 else { continue }
                 if score(t, Int(top.key)) >= bestScore[t] * 0.35 { choice[t] = top.key }
+            }
+        }
+
+        // Surfaces no photo saw cleanly: take the best of the looser views rather than leaving them flat grey.
+        choice.withUnsafeMutableBufferPointer { choiceBuf in
+            DispatchQueue.concurrentPerform(iterations: chunks) { ci in
+                for t in (ci * chunkSize)..<min(triCount, (ci + 1) * chunkSize) where choiceBuf[t] < 0 {
+                    var bs: Float = 0, bi: Int32 = -1
+                    for fi in frames.indices {
+                        let s = score(t, fi, relaxed: true)
+                        if s > bs { bs = s; bi = Int32(fi) }
+                    }
+                    choiceBuf[t] = bi
+                }
             }
         }
 
