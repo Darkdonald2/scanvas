@@ -49,6 +49,16 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
     private var photoCount = 0
     /// Lock exposure and white balance once tracking settles, so every photo has the same brightness and colour.
     var lockExposure = true
+    /// Called on the main thread for every camera frame (pipe tracing uses it to aim).
+    var frameHandler: ((ARFrame) -> Void)?
+    /// Detect horizontal planes so the floor and ceiling heights are known while scanning.
+    var detectPlanes = false
+    /// ARKit Y of the lowest floor plane and the ceiling plane seen so far.
+    @Published var floorEstimate: Float?
+    @Published var ceilingEstimate: Float?
+    var showMesh = true {
+        didSet { arView.debugOptions = showMesh ? [.showSceneUnderstanding] : [] }
+    }
     private var exposureLocked = false
     private var normalSince: TimeInterval?
     /// Every mesh anchor seen so far. Kept here so the scan survives the app being paused
@@ -83,6 +93,12 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
         }
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
             config.frameSemantics.insert(.sceneDepth)
+        }
+        if detectPlanes {
+            config.planeDetection = [.horizontal]
+            if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+                config.frameSemantics.insert(.smoothedSceneDepth)
+            }
         }
         config.environmentTexturing = .none
         config.worldAlignment = .gravity
@@ -123,6 +139,18 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
         anchorLock.lock()
         for case let a as ARMeshAnchor in anchors { meshAnchors[a.identifier] = a }
         anchorLock.unlock()
+        guard detectPlanes else { return }
+        var floor = floorEstimate, ceiling = ceilingEstimate
+        for case let p as ARPlaneAnchor in anchors where p.planeExtent.width * p.planeExtent.height > 0.5 {
+            let y = (p.transform * SIMD4(p.center, 1)).y
+            switch p.classification {
+            case .floor: floor = min(floor ?? y, y)
+            case .ceiling: ceiling = max(ceiling ?? y, y)
+            default: break
+            }
+        }
+        if floor != floorEstimate { floorEstimate = floor }
+        if ceiling != ceilingEstimate { ceilingEstimate = ceiling }
     }
 
     /// Smoothed walking and turning speed; flags "too fast" after it lasts a moment, clears after it calms down.
@@ -147,6 +175,7 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let now = frame.timestamp
+        frameHandler?(frame)
         trackSpeed(frame.camera.transform, now)
         if lockExposure && !exposureLocked && isScanning {
             if case .normal = frame.camera.trackingState {

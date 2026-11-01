@@ -3,7 +3,7 @@ import RoomPlan
 import RealityKit
 
 enum CaptureMode: String, Identifiable {
-    case room, space, object, photos, measure
+    case room, space, object, photos, measure, pipes
     var id: String { rawValue }
 }
 
@@ -39,7 +39,9 @@ struct HomeView: View {
                 .padding()
             }
             .navigationTitle("Scanvas")
-            .navigationDestination(for: ScanProject.self) { ProjectDetailView(project: $0) }
+            .navigationDestination(for: ScanProject.self) { p in
+                if p.kind == .pipe { PipeDetailView(project: p) } else { ProjectDetailView(project: p) }
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showSettings = true } label: { Image(systemName: "gearshape") }
@@ -55,6 +57,7 @@ struct HomeView: View {
                 case .object: ObjectCaptureFlowView(project: ScanProject(name: store.nextName(for: .object), kind: .object), onSaved: open)
                 case .photos: PhotosTo3DView(onSaved: open)
                 case .measure: MeasureView()
+                case .pipes: PipeSurveyView(onSaved: open)
                 }
             }
             .environmentObject(store)
@@ -87,8 +90,13 @@ struct HomeView: View {
                     start(.photos, supported: Photogrammetry.isSupported, reason: "On-device photo reconstruction needs a LiDAR iPhone or iPad.")
                 }
             }
-            ModeTile(title: "Measure", subtitle: "Tap-to-measure distances in AR", icon: "ruler", color: .pink, wide: true) {
-                start(.measure, supported: true, reason: "")
+            HStack(spacing: 12) {
+                ModeTile(title: "Pipes", subtitle: "Trace drainage runs: lengths, falls, levels, photos", icon: "point.topleft.down.curvedto.point.bottomright.up", color: .cyan) {
+                    start(.pipes, supported: MeshScanner.isSupported, reason: "Pipe surveys need a LiDAR sensor.")
+                }
+                ModeTile(title: "Measure", subtitle: "Tap-to-measure distances in AR", icon: "ruler", color: .pink) {
+                    start(.measure, supported: true, reason: "")
+                }
             }
         }
     }

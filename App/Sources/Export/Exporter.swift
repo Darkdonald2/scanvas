@@ -2,6 +2,7 @@ import Foundation
 import simd
 
 enum ExportFormat: String, CaseIterable, Identifiable {
+    case pipeReport, pipeDXF, pipeIFC, pipeCSV, pipePNG
     case dxfPlan, dxf3D, ifc, pdfPlan, pngPlan, obj, usdz, roomPlanUSDZ, glb, stl, ply, pts, xyz, csv
 
     var id: String { rawValue }
@@ -22,6 +23,11 @@ enum ExportFormat: String, CaseIterable, Identifiable {
         case .pts: return "Point cloud · PTS"
         case .xyz: return "Point cloud · XYZ"
         case .csv: return "Measurements · CSV"
+        case .pipeReport: return "Survey report · PDF"
+        case .pipeDXF: return "Pipe drawing · DXF"
+        case .pipeIFC: return "Pipes · IFC (Revit)"
+        case .pipeCSV: return "Pipe schedule · CSV"
+        case .pipePNG: return "Pipe plan · PNG"
         }
     }
 
@@ -41,6 +47,11 @@ enum ExportFormat: String, CaseIterable, Identifiable {
         case .pts: return "Autodesk ReCap → RCP for AutoCAD / Revit point clouds."
         case .xyz: return "Any point-cloud tool."
         case .csv: return "Wall lengths, heights, openings and areas for Excel."
+        case .pipeReport: return "Plan with flow arrows and falls, run and segment tables, invert levels, and photos with the pipes drawn on."
+        case .pipeDXF: return "AutoCAD: one layer per system (P-WP, P-SP…), 2D polylines, 3D polylines at true levels, fittings, labels, invert levels."
+        case .pipeIFC: return "Revit / BIM: each segment as a pipe (IfcFlowSegment) with size, fall and invert levels, grouped by system."
+        case .pipeCSV: return "Every point with X, Y, level, invert, chainage and the fall to the next point."
+        case .pipePNG: return "Plan image for messages."
         }
     }
 
@@ -57,7 +68,11 @@ enum ExportFormat: String, CaseIterable, Identifiable {
         case .ply: return "ply"
         case .pts: return "pts"
         case .xyz: return "xyz"
-        case .csv: return "csv"
+        case .csv, .pipeCSV: return "csv"
+        case .pipeReport: return "pdf"
+        case .pipeDXF: return "dxf"
+        case .pipeIFC: return "ifc"
+        case .pipePNG: return "png"
         }
     }
 
@@ -68,6 +83,10 @@ enum ExportFormat: String, CaseIterable, Identifiable {
         case .pdfPlan, .pngPlan: return "-plan"
         case .roomPlanUSDZ: return "-roomplan"
         case .pts, .xyz: return "-points"
+        case .pipeReport: return "-report"
+        case .pipeDXF, .pipeIFC: return "-pipes"
+        case .pipeCSV: return "-schedule"
+        case .pipePNG: return "-plan"
         default: return ""
         }
     }
@@ -80,10 +99,13 @@ enum ExportFormat: String, CaseIterable, Identifiable {
             return [.dxfPlan, .dxf3D, .ifc, .pdfPlan, .pngPlan, .obj, .usdz, .glb, .stl, .ply, .pts, .xyz]
         case .object:
             return [.usdz, .obj, .glb, .stl, .ply, .dxf3D, .ifc, .pts, .xyz]
+        case .pipe:
+            return [.pipeReport, .pipeDXF, .pipeIFC, .pipeCSV, .pipePNG, .obj, .usdz, .glb, .ply, .pts]
         }
     }
 
     static let defaults: Set<ExportFormat> = [.dxfPlan, .ifc, .obj]
+    static let pipeDefaults: Set<ExportFormat> = [.pipeReport, .pipeDXF, .pipeIFC]
 }
 
 struct ExportOptions {
@@ -105,6 +127,10 @@ enum Exporter {
         let safeName = project.name.components(separatedBy: CharacterSet(charactersIn: "/\\:?%*|\"<>")).joined(separator: "-")
         let outDir = ProjectStore.exportsRoot.appendingPathComponent(safeName, isDirectory: true)
         try fm.createDirectory(at: outDir, withIntermediateDirectories: true)
+        if project.kind == .pipe {
+            return try PipeExport.export(project: project, folder: folder, formats: formats, options: options,
+                                         outDir: outDir, safeName: safeName, progress: progress)
+        }
 
         let plan: PlanModel? = (try? Data(contentsOf: folder.appendingPathComponent(ProjectFile.plan)))
             .flatMap { try? JSONDecoder().decode(PlanModel.self, from: $0) }
@@ -202,6 +228,8 @@ enum Exporter {
                 try MeshFormats.pts(mesh, floor: floor, to: url)
             case .xyz:
                 try MeshFormats.xyz(mesh, floor: floor, to: url)
+            case .pipeReport, .pipeDXF, .pipeIFC, .pipeCSV, .pipePNG:
+                continue
             case .csv:
                 guard let plan else { continue }
                 try csv(plan, units: options.displayUnits).write(to: url, atomically: true, encoding: .utf8)

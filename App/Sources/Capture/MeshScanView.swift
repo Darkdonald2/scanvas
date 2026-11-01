@@ -115,42 +115,14 @@ struct MeshScanView: View {
         let smooth = smoothMesh
         let scanner = self.scanner
         Task.detached(priority: .userInitiated) {
-            var mesh = collected
             let folder = ProjectStore.folder(for: project.id)
-            let photos = folder.appendingPathComponent(ProjectFile.keyframes, isDirectory: true)
             func report(_ text: String, _ value: Double) {
                 Task { @MainActor in status = text; progress = value }
             }
             do {
-                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-                if smooth {
-                    report("Smoothing mesh…", 0.01)
-                    mesh = mesh.smoothed()
-                }
-                if colour {
-                    report("Colouring mesh…", 0.02)
-                    scanner.colourize(&mesh) { p in report("Colouring mesh…", 0.02 + 0.08 * p) }
-                }
-                try mesh.write(to: folder.appendingPathComponent(ProjectFile.mesh))
-                var thumbScene: SCNScene?
-                if colour {
-                    let frames = scanner.photoKeyframes()
-                    let textured = try Texturer.build(mesh: mesh, keyframes: frames, photos: photos, output: folder) { p in
-                        report(p.message, 0.1 + 0.9 * p.fraction)
-                    }
-                    if !textured.pages.isEmpty {
-                        try textured.write(to: folder.appendingPathComponent(ProjectFile.textured))
-                        thumbScene = SceneExport.texturedScene(textured, folder: folder, dollhouse: false)
-                    }
-                }
-                scanner.clearKeyframes()
-                try? FileManager.default.removeItem(at: photos)
-                report("Saving…", 0.99)
-                if thumbScene == nil {
-                    let preview = mesh.triangleCount > 300_000 ? mesh.simplified(cell: 0.05) : mesh
-                    thumbScene = SceneExport.scene(parts: [("Scan", preview)])
-                }
-                if let scene = thumbScene, let thumb = SceneExport.thumbnail(of: scene) {
+                let (mesh, thumbScene) = try SpaceProcessing.process(collected, scanner: scanner, folder: folder,
+                                                                     smooth: smooth, colour: colour, report: report)
+                if let thumb = SceneExport.thumbnail(of: thumbScene) {
                     try? thumb.write(to: folder.appendingPathComponent(ProjectFile.thumbnail))
                 }
                 let b = mesh.bounds

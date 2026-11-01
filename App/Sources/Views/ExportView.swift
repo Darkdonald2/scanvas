@@ -72,11 +72,14 @@ struct ExportView: View {
                         LabeledContent("Plan section height", value: UnitSystem(rawValue: unitsRaw)?.length(sectionHeight) ?? "")
                     }
                 } header: { Text("Options") } footer: {
-                    Text(project.kind == .space
+                    Text(project.kind == .pipe
+                         ? "For your drawing, pick Metres here: the DXF then pastes straight into a metre-based drawing at the aligned coordinates (set them on the Data tab). The plan background is cut through the scan at \(UnitSystem(rawValue: unitsRaw)?.length(sectionHeight) ?? "") above the floor."
+                         : project.kind == .space
                          ? "Big scans make big CAD files. Use Medium or Low detail for DXF/IFC if AutoCAD or Revit feels slow. Change the section height on the Plan tab."
                          : "Revit: open the IFC, or Insert › Import CAD for the DXF. AutoCAD: open the DXF directly.")
                 }
             }
+            .onAppear { if project.kind == .pipe { selected = ExportFormat.pipeDefaults } }
             .navigationTitle("Export")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

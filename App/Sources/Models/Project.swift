@@ -5,12 +5,14 @@ enum ScanKind: String, Codable, CaseIterable {
     case room      // RoomPlan: walls, doors, windows, furniture
     case space     // LiDAR mesh of any size of space
     case object    // Object Capture / photos → textured model
+    case pipe      // Drainage pipe survey: traced runs + LiDAR scan + photos
 
     var title: String {
         switch self {
         case .room: return "Room"
         case .space: return "Space"
         case .object: return "Object"
+        case .pipe: return "Pipes"
         }
     }
 
@@ -19,6 +21,7 @@ enum ScanKind: String, Codable, CaseIterable {
         case .room: return "square.split.bottomrightquarter"
         case .space: return "cube.transparent"
         case .object: return "shippingbox"
+        case .pipe: return "point.topleft.down.curvedto.point.bottomright.up"
         }
     }
 }
@@ -44,4 +47,6 @@ enum ProjectFile {
     static let thumbnail = "thumb.jpg"
     static let images = "Images"            // Object Capture photos
     static let checkpoint = "Checkpoint"
+    static let pipes = "pipes.json"         // PipeSurvey
+    static let pipePhotos = "PipePhotos"    // full-resolution survey photos
 }

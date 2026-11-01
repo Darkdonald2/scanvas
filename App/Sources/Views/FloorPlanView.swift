@@ -2,7 +2,16 @@ import SwiftUI
 
 /// Zoomable 2D plan drawn with the same renderer as the PDF/PNG exports.
 struct FloorPlanView: View {
-    var drawing: PlanDrawing
+    var render: (CGContext, CGSize) -> Void
+
+    init(drawing: PlanDrawing) {
+        render = { cg, size in
+            PlanRenderer(drawing: drawing, theme: .dark).draw(in: cg, rect: CGRect(origin: .zero, size: size), margin: 30)
+        }
+    }
+
+    init(render: @escaping (CGContext, CGSize) -> Void) { self.render = render }
+
     @State private var scale: CGFloat = 1
     @State private var lastScale: CGFloat = 1
     @State private var offset: CGSize = .zero
@@ -11,9 +20,7 @@ struct FloorPlanView: View {
     var body: some View {
         GeometryReader { geo in
             Canvas { ctx, size in
-                ctx.withCGContext { cg in
-                    PlanRenderer(drawing: drawing, theme: .dark).draw(in: cg, rect: CGRect(origin: .zero, size: size), margin: 30)
-                }
+                ctx.withCGContext { cg in render(cg, size) }
             }
             .frame(width: geo.size.width, height: geo.size.height)
             .scaleEffect(scale)
