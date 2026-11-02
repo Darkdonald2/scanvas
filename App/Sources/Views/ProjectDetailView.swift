@@ -100,17 +100,14 @@ struct ProjectDetailView: View {
                     }
                     .foregroundStyle(.white)
                 }
-                Text(viewMode == .inside ? "Drag to look · joystick to walk · hold ↑ ↓ to rise or sink" : "Drag to orbit · walls nearest you turn see-through")
+                Text(viewMode == .inside ? "Drag to look · left stick walks · right stick rises or sinks" : "Drag to orbit · walls nearest you turn see-through")
                     .font(.caption2).foregroundStyle(.secondary)
                 Spacer()
                 if viewMode == .inside {
                     HStack(alignment: .bottom) {
                         Joystick(value: $move)
                         Spacer()
-                        VStack(spacing: 12) {
-                            HoldButton(systemImage: "arrow.up") { lift = $0 ? 1 : 0 }
-                            HoldButton(systemImage: "arrow.down") { lift = $0 ? -1 : 0 }
-                        }
+                        LiftStick(value: $lift)
                     }
                 }
             }

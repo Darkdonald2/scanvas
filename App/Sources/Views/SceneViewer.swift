@@ -224,6 +224,41 @@ struct Joystick: View {
     }
 }
 
+/// Vertical stick for rising and sinking in the inside view: push the knob up to rise, down to sink.
+/// Speed follows how far you push. Uses the same drag handling as the joystick so both directions behave alike.
+struct LiftStick: View {
+    @Binding var value: Float
+    @State private var knob: CGFloat = 0
+    private let travel: CGFloat = 46
+
+    var body: some View {
+        ZStack {
+            Capsule().fill(.ultraThinMaterial).frame(width: 56, height: travel * 2 + 40)
+            VStack {
+                Image(systemName: "chevron.up")
+                Spacer()
+                Image(systemName: "chevron.down")
+            }
+            .font(.caption.bold()).foregroundStyle(.white.opacity(0.7))
+            .frame(height: travel * 2 + 24)
+            Circle().fill(Color.white.opacity(0.85)).frame(width: 40, height: 40)
+                .overlay(Image(systemName: "arrow.up.and.down").font(.caption.bold()).foregroundStyle(.black))
+                .offset(y: knob)
+        }
+        .contentShape(Capsule())
+        .gesture(DragGesture(minimumDistance: 0)
+            .onChanged { g in
+                let y = max(-travel, min(travel, g.translation.height))
+                knob = y
+                value = Float(-y / travel)
+            }
+            .onEnded { _ in
+                withAnimation(.spring(duration: 0.2)) { knob = 0 }
+                value = 0
+            })
+    }
+}
+
 /// Press-and-hold button for rising or sinking in the inside view.
 struct HoldButton: View {
     var systemImage: String
