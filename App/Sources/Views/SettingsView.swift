@@ -9,7 +9,7 @@ struct SettingsView: View {
     @AppStorage("smoothMesh") private var smoothMesh = true
     @AppStorage("lockExposure") private var lockExposure = true
     @AppStorage("cleanMesh") private var cleanMesh = false
-    @AppStorage("refineCameras") private var refineCameras = false
+    @AppStorage("refineCameras") private var refineCameras = true
     @AppStorage("compactTextures") private var compactTextures = true
     @AppStorage("fullResPhotos") private var fullResPhotos = true
 

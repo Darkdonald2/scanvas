@@ -77,3 +77,28 @@ extension MeshData {
         return out
     }
 }
+
+extension MeshData {
+    /// Makes triangles (winding and normals) face the side the scanner was on. LiDAR surfaces are always seen
+    /// from the camera side, so the camera path is a reliable reference; guessing from stored normals
+    /// can go wrong after vertices are merged, which turns the whole scan inside out.
+    func orientedToward(cameras: [SIMD3<Float>]) -> MeshData {
+        guard triangleCount > 0, !cameras.isEmpty else { return self }
+        let cams = cameras.count > 300 ? Swift.stride(from: 0, to: cameras.count, by: cameras.count / 300).map { cameras[$0] } : cameras
+        var score: Float = 0
+        let step = max(1, triangleCount / 4000)
+        for t in Swift.stride(from: 0, to: triangleCount, by: step) {
+            let a = positions[Int(indices[3 * t])], b = positions[Int(indices[3 * t + 1])], c = positions[Int(indices[3 * t + 2])]
+            let centre = (a + b + c) / 3
+            guard let cam = cams.min(by: { simd_distance_squared($0, centre) < simd_distance_squared($1, centre) }) else { continue }
+            let d = simd_normalize(cam - centre)
+            score += simd_dot(faceNormal(t), d) > 0 ? 1 : -1
+        }
+        var m = self
+        if score < 0 {
+            for t in 0..<triangleCount { m.indices.swapAt(3 * t + 1, 3 * t + 2) }
+        }
+        m.computeNormals()
+        return m
+    }
+}

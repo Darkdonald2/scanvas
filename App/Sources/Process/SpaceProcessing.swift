@@ -12,7 +12,7 @@ enum SpaceProcessing {
         var log = ["collected: \(collected.triangleCount) triangles, \(collected.vertexCount) vertices, classes \(collected.faceClasses.count)"]
         let defaults = UserDefaults.standard
         let clean = defaults.object(forKey: "cleanMesh") as? Bool ?? false
-        let refine = defaults.object(forKey: "refineCameras") as? Bool ?? false
+        let refine = defaults.object(forKey: "refineCameras") as? Bool ?? true
         let photos = folder.appendingPathComponent(ProjectFile.keyframes, isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         if clean {
@@ -25,6 +25,12 @@ enum SpaceProcessing {
             report("Smoothing mesh…", 0.015)
             mesh = mesh.smoothed()
             log.append("smoothed: \(mesh.triangleCount) triangles, normals match winding \(SceneExport.facesTowardNormals(mesh))")
+        }
+        // Face every surface towards where the scanner was (keeps the scan from turning inside out).
+        let cameras = scanner.correctedKeyframes().map { $0.cameraPosition }
+        if !cameras.isEmpty {
+            mesh = mesh.orientedToward(cameras: cameras)
+            log.append("oriented to \(cameras.count) camera positions, normals match winding \(SceneExport.facesTowardNormals(mesh))")
         }
         if colour {
             report("Colouring mesh…", 0.02)
