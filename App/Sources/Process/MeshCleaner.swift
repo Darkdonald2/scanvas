@@ -2,9 +2,9 @@ import Foundation
 import simd
 
 extension MeshData {
-    /// "Cleaning mesh": welds the anchor seams, drops collapsed and long sliver triangles (LiDAR stretches these
-    /// across gaps, and they smear textures), and removes small floating fragments such as people walking past.
-    func cleaned(minFragmentArea: Float = 0.08) -> MeshData {
+    /// "Cleaning mesh": welds the anchor seams, drops collapsed triangles, and removes small floating
+    /// fragments (bits of people walking past, reflections), without ever touching the main surfaces.
+    func cleaned(minFragmentArea: Float = 0.03) -> MeshData {
         let m = welded()
         let tris = m.triangleCount
         guard tris > 0 else { return m }
@@ -30,8 +30,10 @@ extension MeshData {
             let area = simd_length(simd_cross(b - a, c - a)) / 2
             let longest = max(simd_distance(a, b), simd_distance(b, c), simd_distance(c, a))
             areas[t] = area
-            // A triangle at least 30 cm long but under 1 cm wide is a stretched gap, not a surface.
-            sliver[t] = area < 1e-8 || (longest > 0.3 && 2 * area / longest < 0.01)
+            // Only truly collapsed triangles. LiDAR meshes describe flat walls with long thin triangles,
+            // so thin is not the same as broken.
+            _ = longest
+            sliver[t] = area < 1e-9
             if !sliver[t] { union(ia, ib); union(ib, ic) }
         }
         var componentArea: [Int32: Float] = [:]
@@ -41,11 +43,16 @@ extension MeshData {
             total += areas[t]
         }
         // Small objects scanned on their own are one small piece: never delete the main part of a scan.
-        let threshold = min(minFragmentArea, total * 0.05)
+        let threshold = min(minFragmentArea, total * 0.01)
         var keep = [Bool](repeating: false, count: tris)
+        var keptArea: Float = 0
         for t in 0..<tris where !sliver[t] {
             keep[t] = (componentArea[find(Int32(m.indices[3 * t]))] ?? 0) >= threshold
+            if keep[t] { keptArea += areas[t] }
         }
+        // Safety net: floaters are a tiny share of a scan. If cleaning would remove more than 3% of the
+        // surface, the mesh is just made of many separate pieces, so leave it as it is.
+        if keptArea < total * 0.97 { return m }
         return m.keeping(keep)
     }
 

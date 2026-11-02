@@ -116,22 +116,28 @@ enum CameraRefiner {
             err /= Float(inliers)
             if firstError < 0 { firstError = err }
             lastError = err; lastInliers = inliers
-            for a in 0..<6 { for c in 0..<a { A[a * 6 + c] = A[c * 6 + a] }; A[a * 6 + a] += 1e-3 * Double(inliers) * 1e-3 }
-            guard let x = solve6(A, b) else { return nil }
-            let omega = SIMD3(Float(x[0]), Float(x[1]), Float(x[2])), t = SIMD3(Float(x[3]), Float(x[4]), Float(x[5]))
+            for a in 0..<6 { for c in 0..<a { A[a * 6 + c] = A[c * 6 + a] } }
+            // Strong damping: a photo that only sees one wall or the floor can slide along it without changing
+            // the fit, so directions the depth doesn't pin down must stay put rather than drift.
+            var trace = 0.0
+            for a in 0..<6 { trace += A[a * 6 + a] }
+            for a in 0..<6 { A[a * 6 + a] += 0.05 * trace / 6 }
+            guard let x = solve6(A, b), x.allSatisfy({ $0.isFinite }) else { return nil }
+            var omega = SIMD3(Float(x[0]), Float(x[1]), Float(x[2])), t = SIMD3(Float(x[3]), Float(x[4]), Float(x[5]))
+            if simd_length(t) > 0.02 { t *= 0.02 / simd_length(t) }
+            if simd_length(omega) > 0.01 { omega *= 0.01 / simd_length(omega) }
             let angle = simd_length(omega)
             let rot = angle > 1e-9 ? simd_float4x4(simd_quatf(angle: angle, axis: omega / angle)) : matrix_identity_float4x4
             let delta = translation(centre + t) * rot * translation(-centre)
             pose = delta * pose
             if angle < 1e-4 && simd_length(t) < 1e-4 { break }
         }
-        _ = lastInliers
         // Accept only a modest correction that actually improved the fit.
         let moved = simd_distance(SIMD3(pose.columns.3.x, pose.columns.3.y, pose.columns.3.z),
                                   SIMD3(original.columns.3.x, original.columns.3.y, original.columns.3.z))
         let f0 = SIMD3(original.columns.2.x, original.columns.2.y, original.columns.2.z), f1 = SIMD3(pose.columns.2.x, pose.columns.2.y, pose.columns.2.z)
         let turned = acos(min(1, max(-1, simd_dot(f0, f1))))
-        guard moved < 0.15, turned < 0.08, lastError <= firstError else { return nil }
+        guard moved < 0.05, turned < 0.03, lastError < firstError * 0.97, lastInliers >= 200 else { return nil }
         var out = f
         out.worldToCamera = pose.inverse
         out.cameraPosition = SIMD3(pose.columns.3.x, pose.columns.3.y, pose.columns.3.z)
