@@ -20,7 +20,10 @@ struct Keyframe {
     /// Image sharpness (variance of the Laplacian); low means motion blur.
     var sharpness: Float = 1
 
-    static let photoWidth = 1920, photoHeight = 1440
+    /// Photos are full camera resolution unless turned off in Settings (1600×1200 then).
+    static var fullResolution: Bool { UserDefaults.standard.object(forKey: "fullResPhotos") as? Bool ?? true }
+    static var photoWidth: Int { fullResolution ? 1920 : 1600 }
+    static var photoHeight: Int { fullResolution ? 1440 : 1200 }
     static func photoName(_ n: Int) -> String { "photo_\(n).jpg" }
 }
 

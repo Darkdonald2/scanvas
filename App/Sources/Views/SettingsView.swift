@@ -8,6 +8,10 @@ struct SettingsView: View {
     @AppStorage("captureColour") private var captureColour = true
     @AppStorage("smoothMesh") private var smoothMesh = true
     @AppStorage("lockExposure") private var lockExposure = true
+    @AppStorage("cleanMesh") private var cleanMesh = false
+    @AppStorage("refineCameras") private var refineCameras = false
+    @AppStorage("compactTextures") private var compactTextures = true
+    @AppStorage("fullResPhotos") private var fullResPhotos = true
 
     var body: some View {
         NavigationStack {
@@ -33,6 +37,14 @@ struct SettingsView: View {
                     Toggle("Lock exposure while scanning", isOn: $lockExposure)
                 } header: { Text("Space scans") } footer: {
                     Text("Photo textures: takes photos while you scan and wraps the mesh in them afterwards. Smooth mesh: removes LiDAR bumps and noise. Lock exposure: keeps brightness and colour the same in every photo so walls don't look patchy; turn it off if you walk between very bright and very dark areas. Turn photo textures off for very long scans to save memory.")
+                }
+                Section {
+                    Toggle("Sharper textures (compact packing)", isOn: $compactTextures)
+                    Toggle("Full-resolution photos", isOn: $fullResPhotos)
+                    Toggle("Refine camera positions", isOn: $refineCameras)
+                    Toggle("Clean mesh (remove floating bits)", isOn: $cleanMesh)
+                } header: { Text("Processing (testing)") } footer: {
+                    Text("New processing steps you can switch on and off to compare. Each scan's ⋯ menu shows which ones it was made with.")
                 }
                 Section("About") {
                     LabeledContent("Version", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")

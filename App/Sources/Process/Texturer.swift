@@ -12,6 +12,11 @@ enum Texturer {
 
     struct Progress { var message: String; var fraction: Double }
 
+    /// Numbers from the last texturing run, for the processing report.
+    static var lastStats = ""
+    /// Crop each photo around the connected patches it covers (true) or around everything it covers (false).
+    static var compactCharts: Bool { UserDefaults.standard.object(forKey: "compactTextures") as? Bool ?? true }
+
     static func build(mesh: MeshData, keyframes: [Keyframe], photos: URL, output folder: URL,
                       progress: (Progress) -> Void) throws -> TexturedMesh {
         let frames = keyframes.filter { FileManager.default.fileExists(atPath: photos.appendingPathComponent(Keyframe.photoName($0.photo)).path) }
@@ -178,7 +183,8 @@ enum Texturer {
             while parent[Int(c)] != r { let next = parent[Int(c)]; parent[Int(c)] = r; c = next }
             return r
         }
-        for t in 0..<triCount where choice[t] >= 0 {
+        let compact = compactCharts
+        for t in 0..<triCount where compact && choice[t] >= 0 {
             for nb in adjacency[t] where choice[Int(nb)] == choice[t] {
                 let a = root(Int32(t)), b = root(nb)
                 if a != b { parent[Int(max(a, b))] = min(a, b) }
@@ -187,7 +193,8 @@ enum Texturer {
         var chartOf: [Int32: Int] = [:]
         var chartTris: [[Int]] = []
         for t in 0..<triCount where choice[t] >= 0 {
-            let r = root(Int32(t))
+            // Without compact charts, one crop per photo (the older behaviour).
+            let r = compact ? root(Int32(t)) : choice[t]
             if let c = chartOf[r] { chartTris[c].append(t) } else { chartOf[r] = chartTris.count; chartTris.append([t]) }
         }
         chartOf = [:]
@@ -234,6 +241,7 @@ enum Texturer {
             return true
         }
         while !pack() { scale *= 0.9 }
+        lastStats = "photos \(frames.count), crops \(crops.count), pages \(pages), scale \(String(format: "%.2f", Double(scale))), untextured \(untextured.count) of \(triCount)"
 
         // Draw the pages.
         let format = UIGraphicsImageRendererFormat()

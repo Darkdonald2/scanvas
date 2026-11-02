@@ -30,6 +30,7 @@ struct ProjectDetailView: View {
     @State private var newName = ""
     @State private var confirmDelete = false
     @State private var loading = true
+    @State private var processingInfo: String?
 
     private var units: UnitSystem { UnitSystem(rawValue: unitsRaw) ?? .metric }
     private var current: ScanProject { store.projects.first { $0.id == project.id } ?? project }
@@ -64,6 +65,11 @@ struct ProjectDetailView: View {
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
+                    if store.has("processing.txt", in: current) {
+                        Button {
+                            processingInfo = (try? String(contentsOf: store.url("processing.txt", in: current), encoding: .utf8)) ?? ""
+                        } label: { Label("Processing details", systemImage: "info.circle") }
+                    }
                     Button { newName = current.name; renaming = true } label: { Label("Rename", systemImage: "pencil") }
                     Button(role: .destructive) { confirmDelete = true } label: { Label("Delete", systemImage: "trash") }
                 } label: { Image(systemName: "ellipsis.circle") }
@@ -80,6 +86,9 @@ struct ProjectDetailView: View {
         .confirmationDialog("Delete this scan?", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete", role: .destructive) { store.delete(current); dismiss() }
         }
+        .alert("Processing details", isPresented: Binding(get: { processingInfo != nil }, set: { if !$0 { processingInfo = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: { Text(processingInfo ?? "") }
         .task { await load() }
         .onChange(of: shading) { _, _ in rebuildScene() }
         .onChange(of: tab) { _, t in if t == .plan && project.kind == .space && section.isEmpty { recomputeSection() } }
