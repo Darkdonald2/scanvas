@@ -8,7 +8,7 @@ import simd
 /// packed into a few large texture pages.
 enum Texturer {
     static let pageSize = 4096
-    static let maxPages = 8
+    static let maxPages = 10
 
     struct Progress { var message: String; var fraction: Double }
 
@@ -159,9 +159,7 @@ enum Texturer {
         progress(Progress(message: "Packing photo textures…", fraction: 0.7))
 
         // Group triangles by photo and find the part of each photo they use.
-        var groups = [[Int]](repeating: [], count: frames.count)
-        var untextured: [Int] = []
-        for t in 0..<triCount { if choice[t] >= 0 { groups[Int(choice[t])].append(t) } else { untextured.append(t) } }
+        let untextured = (0..<triCount).filter { choice[$0] < 0 }
 
         func pixel(_ p: SIMD3<Float>, _ f: Keyframe) -> SIMD2<Float> {
             let q = f.worldToCamera * SIMD4(p, 1)
@@ -169,9 +167,37 @@ enum Texturer {
             return SIMD2((f.fx * q.x / z + f.cx) * k, (f.cy - f.fy * q.y / z) * k)
         }
 
-        struct Crop { var frame: Int; var rect: CGRect; var page = 0; var origin = CGPoint.zero }
+        // Split each photo's triangles into connected patches ("charts") and crop only around each patch.
+        // Cropping whole photos wastes most of the texture space on long scans and forces everything to shrink.
+        var parent = [Int32](repeating: -1, count: triCount)
+        for t in 0..<triCount where choice[t] >= 0 { parent[t] = Int32(t) }
+        func root(_ x: Int32) -> Int32 {
+            var r = x
+            while parent[Int(r)] != r { r = parent[Int(r)] }
+            var c = x
+            while parent[Int(c)] != r { let next = parent[Int(c)]; parent[Int(c)] = r; c = next }
+            return r
+        }
+        for t in 0..<triCount where choice[t] >= 0 {
+            for nb in adjacency[t] where choice[Int(nb)] == choice[t] {
+                let a = root(Int32(t)), b = root(nb)
+                if a != b { parent[Int(max(a, b))] = min(a, b) }
+            }
+        }
+        var chartOf: [Int32: Int] = [:]
+        var chartTris: [[Int]] = []
+        for t in 0..<triCount where choice[t] >= 0 {
+            let r = root(Int32(t))
+            if let c = chartOf[r] { chartTris[c].append(t) } else { chartOf[r] = chartTris.count; chartTris.append([t]) }
+        }
+        chartOf = [:]
+        adjacency = []
+
+        struct Crop { var frame: Int; var tris: [Int]; var rect: CGRect; var page = 0; var origin = CGPoint.zero }
         var crops: [Crop] = []
-        for (fi, tris) in groups.enumerated() where !tris.isEmpty {
+        crops.reserveCapacity(chartTris.count)
+        for tris in chartTris {
+            let fi = Int(choice[tris[0]])
             var lo = SIMD2<Float>(repeating: .greatestFiniteMagnitude), hi = -lo
             for t in tris {
                 for j in 0..<3 {
@@ -179,11 +205,14 @@ enum Texturer {
                     lo = simd_min(lo, px); hi = simd_max(hi, px)
                 }
             }
-            let pad: Float = 6
+            let pad: Float = 4
             lo = simd_max(lo - pad, .zero); hi = simd_min(hi + pad, SIMD2(W, H))
-            crops.append(Crop(frame: fi, rect: CGRect(x: CGFloat(lo.x.rounded(.down)), y: CGFloat(lo.y.rounded(.down)),
-                                                      width: CGFloat((hi.x - lo.x).rounded(.up)), height: CGFloat((hi.y - lo.y).rounded(.up)))))
+            hi = simd_max(hi, lo + 1)
+            crops.append(Crop(frame: fi, tris: tris,
+                              rect: CGRect(x: CGFloat(lo.x.rounded(.down)), y: CGFloat(lo.y.rounded(.down)),
+                                           width: CGFloat((hi.x - lo.x).rounded(.up)), height: CGFloat((hi.y - lo.y).rounded(.up)))))
         }
+        chartTris = []
 
         // Shrink everything evenly if the photos would need more than `maxPages` pages.
         let page = CGFloat(pageSize)
@@ -212,31 +241,35 @@ enum Texturer {
         format.opaque = true
         let ci = CIContext(options: [.cacheIntermediates: false])
         for p in 0..<pages {
-            progress(Progress(message: "Building texture \(p + 1) of \(pages)…", fraction: 0.75 + 0.2 * Double(p) / Double(pages)))
+            progress(Progress(message: "Encoding texture \(p + 1) of \(pages)…", fraction: 0.75 + 0.2 * Double(p) / Double(pages)))
             try autoreleasepool {
                 let image = UIGraphicsImageRenderer(size: CGSize(width: page, height: page), format: format).image { ctx in
                     UIColor(white: 0.5, alpha: 1).setFill()
                     ctx.fill(CGRect(x: 0, y: 0, width: page, height: page))
-                    for crop in crops where crop.page == p {
+                    let onPage = crops.filter { $0.page == p }
+                    let byFrame = Dictionary(grouping: onPage, by: { $0.frame })
+                    for (fi, list) in byFrame {
                         autoreleasepool {
-                            let url = photos.appendingPathComponent(Keyframe.photoName(frames[crop.frame].photo))
-                            guard let photo = UIImage(contentsOfFile: url.path)?.cgImage,
-                                  var part = photo.cropping(to: crop.rect) else { return }
-                            let g = gains[crop.frame]
+                            let url = photos.appendingPathComponent(Keyframe.photoName(frames[fi].photo))
+                            guard var photo = UIImage(contentsOfFile: url.path)?.cgImage else { return }
+                            let g = gains[fi]
                             if abs(g.x - 1) + abs(g.y - 1) + abs(g.z - 1) > 0.02 {
-                                let image = CIImage(cgImage: part).applyingFilter("CIColorMatrix", parameters: [
+                                let image = CIImage(cgImage: photo).applyingFilter("CIColorMatrix", parameters: [
                                     "inputRVector": CIVector(x: CGFloat(g.x), y: 0, z: 0, w: 0),
                                     "inputGVector": CIVector(x: 0, y: CGFloat(g.y), z: 0, w: 0),
                                     "inputBVector": CIVector(x: 0, y: 0, z: CGFloat(g.z), w: 0),
                                 ])
-                                if let adjusted = ci.createCGImage(image, from: image.extent) { part = adjusted }
+                                if let adjusted = ci.createCGImage(image, from: image.extent) { photo = adjusted }
                             }
-                            UIImage(cgImage: part).draw(in: CGRect(x: crop.origin.x, y: crop.origin.y,
-                                                                   width: crop.rect.width * scale, height: crop.rect.height * scale))
+                            for crop in list {
+                                guard let part = photo.cropping(to: crop.rect) else { continue }
+                                UIImage(cgImage: part).draw(in: CGRect(x: crop.origin.x, y: crop.origin.y,
+                                                                       width: crop.rect.width * scale, height: crop.rect.height * scale))
+                            }
                         }
                     }
                 }
-                guard let data = image.jpegData(compressionQuality: 0.85) else { throw CocoaError(.fileWriteUnknown) }
+                guard let data = image.jpegData(compressionQuality: 0.9) else { throw CocoaError(.fileWriteUnknown) }
                 try data.write(to: folder.appendingPathComponent(TexturedMesh.textureName(p)), options: .atomic)
             }
         }
@@ -249,7 +282,7 @@ enum Texturer {
             // Move the page out so appends don't copy it.
             var pg = result.pages[crop.page]
             result.pages[crop.page] = TexturedMesh.Page()
-            for t in groups[crop.frame] {
+            for t in crop.tris {
                 for j in 0..<3 {
                     let vi = Int(mesh.indices[3 * t + j])
                     let px = pixel(mesh.positions[vi], f)

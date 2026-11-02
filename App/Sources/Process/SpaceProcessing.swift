@@ -11,8 +11,11 @@ enum SpaceProcessing {
         var mesh = collected
         let photos = folder.appendingPathComponent(ProjectFile.keyframes, isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        report("Cleaning mesh…", 0.01)
+        let cleaned = mesh.cleaned()
+        if !cleaned.isEmpty { mesh = cleaned }
         if smooth {
-            report("Smoothing mesh…", 0.01)
+            report("Smoothing mesh…", 0.015)
             mesh = mesh.smoothed()
         }
         if colour {
@@ -22,9 +25,12 @@ enum SpaceProcessing {
         try mesh.write(to: folder.appendingPathComponent(ProjectFile.mesh))
         var scene: SCNScene?
         if colour {
-            let frames = scanner.photoKeyframes()
+            report("Refining cameras…", 0.1)
+            let frames = CameraRefiner.refine(scanner.photoKeyframes(), mesh: mesh) { p in
+                report("Refining cameras…", 0.1 + 0.1 * p)
+            }
             let textured = try Texturer.build(mesh: mesh, keyframes: frames, photos: photos, output: folder) { p in
-                report(p.message, 0.1 + 0.85 * p.fraction)
+                report(p.message, 0.2 + 0.76 * p.fraction)
             }
             if !textured.pages.isEmpty {
                 try textured.write(to: folder.appendingPathComponent(ProjectFile.textured))

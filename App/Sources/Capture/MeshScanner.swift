@@ -20,7 +20,7 @@ struct Keyframe {
     /// Image sharpness (variance of the Laplacian); low means motion blur.
     var sharpness: Float = 1
 
-    static let photoWidth = 1600, photoHeight = 1200
+    static let photoWidth = 1920, photoHeight = 1440
     static func photoName(_ n: Int) -> String { "photo_\(n).jpg" }
 }
 
@@ -36,7 +36,7 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
 
     let arView: ARView
     var captureColour = true
-    var maxKeyframes = 700
+    var maxKeyframes = 900
 
     private var keyframes: [Keyframe] = []
     private var lastKeyTransform: simd_float4x4?
@@ -229,14 +229,15 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
             lock.lock()
             keyframes.append(kf)
             if keyframes.count > maxKeyframes {
-                // Keep coverage across the whole scan: drop every other old keyframe.
-                keyframes = keyframes.enumerated().filter { $0.offset % 2 == 0 || $0.offset > keyframes.count - 20 }.map { $0.element }
+                // Long scans: drop the photo that adds least, i.e. the blurrier of the two most similar views,
+                // so coverage of the whole space stays even instead of thinning out the start of the scan.
+                keyframes.remove(at: Self.mostRedundant(keyframes))
             }
             lock.unlock()
         }
     }
 
-    /// The camera image scaled to 1280×960 (same framing as the keyframe).
+    /// The camera image at full resolution (same framing as the keyframe).
     private func photo(from frame: ARFrame) -> CGImage? {
         let image = CIImage(cvPixelBuffer: frame.capturedImage)
         let sx = CGFloat(Keyframe.photoWidth) / image.extent.width, sy = CGFloat(Keyframe.photoHeight) / image.extent.height
@@ -292,6 +293,27 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     /// Downsamples the YCbCr camera image to 256×192 RGB and copies the depth map.
+    /// Index of the keyframe whose view is most nearly duplicated by another one (the recent ones are kept).
+    static func mostRedundant(_ frames: [Keyframe]) -> Int {
+        let n = frames.count
+        let forwards = frames.map { f -> SIMD3<Float> in
+            let c = f.worldToCamera.inverse
+            return -SIMD3(c.columns.2.x, c.columns.2.y, c.columns.2.z)
+        }
+        let candidates = max(1, n - 20)
+        var best = (0, Float.greatestFiniteMagnitude)
+        for i in 0..<candidates {
+            for j in (i + 1)..<n {
+                let d = simd_distance(frames[i].cameraPosition, frames[j].cameraPosition) + (1 - simd_dot(forwards[i], forwards[j]))
+                if d < best.1 {
+                    let drop = j < candidates && frames[j].sharpness < frames[i].sharpness ? j : i
+                    best = (drop, d)
+                }
+            }
+        }
+        return best.0
+    }
+
     static func makeKeyframe(_ frame: ARFrame) -> Keyframe? {
         let pb = frame.capturedImage
         guard CVPixelBufferGetPlaneCount(pb) >= 2 else { return nil }
