@@ -143,7 +143,7 @@ extension MeshData {
             // Drop duplicate triangles that collapse onto the same three clusters.
             let m = min(a, b, c), M = max(a, b, c), mid = a ^ b ^ c ^ m ^ M
             if !seen.insert(SIMD3(m, mid, M)).inserted { continue }
-            out.indices += [a, b, c]
+            out.indices.append(a); out.indices.append(b); out.indices.append(c)
             if keepClasses { out.faceClasses.append(faceClasses[t]) }
         }
         out.computeNormals()
@@ -288,7 +288,7 @@ extension MeshData {
         for t in 0..<triangleCount {
             let a = remap[Int(indices[3 * t])], b = remap[Int(indices[3 * t + 1])], c = remap[Int(indices[3 * t + 2])]
             if a == b || b == c || a == c { continue }
-            out.indices += [a, b, c]
+            out.indices.append(a); out.indices.append(b); out.indices.append(c)
             if keepClasses { out.faceClasses.append(faceClasses[t]) }
         }
         return out
@@ -299,35 +299,49 @@ extension MeshData {
         guard !isEmpty else { return self }
         var m = welded()
         let n = m.positions.count
-        // Neighbour lists from triangle edges.
-        var neighbours = [[UInt32]](repeating: [], count: n)
-        for t in 0..<m.triangleCount {
-            let v = [m.indices[3 * t], m.indices[3 * t + 1], m.indices[3 * t + 2]]
-            for (a, b) in [(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
-                if !neighbours[Int(a)].contains(b) { neighbours[Int(a)].append(b) }
-                if !neighbours[Int(b)].contains(a) { neighbours[Int(b)].append(a) }
-            }
-        }
-        // Boundary vertices (on an edge used by only one triangle) stay put so holes don't grow.
-        var edgeUse: [UInt64: UInt8] = [:]
+        // Neighbours from a sorted edge list (compact; per-vertex arrays and an edge dictionary ran long scans
+        // out of memory). An edge used by only one triangle is a boundary: its vertices stay put so holes don't grow.
+        var keys = [UInt64]()
+        keys.reserveCapacity(m.indices.count)
         for t in 0..<m.triangleCount {
             for k in 0..<3 {
                 let a = m.indices[3 * t + k], b = m.indices[3 * t + (k + 1) % 3]
-                let key = UInt64(min(a, b)) << 32 | UInt64(max(a, b))
-                edgeUse[key, default: 0] &+= 1
+                keys.append(UInt64(min(a, b)) << 32 | UInt64(max(a, b)))
             }
         }
+        keys.sort()
         var fixed = [Bool](repeating: false, count: n)
-        for (key, uses) in edgeUse where uses == 1 {
-            fixed[Int(key >> 32)] = true; fixed[Int(key & 0xFFFF_FFFF)] = true
+        var degree = [Int32](repeating: 0, count: n + 1)
+        var unique = [UInt64]()
+        unique.reserveCapacity(keys.count / 2 + 1)
+        var e = 0
+        while e < keys.count {
+            var f = e + 1
+            while f < keys.count && keys[f] == keys[e] { f += 1 }
+            let a = Int(keys[e] >> 32), b = Int(keys[e] & 0xFFFF_FFFF)
+            if f - e == 1 { fixed[a] = true; fixed[b] = true }
+            unique.append(keys[e])
+            degree[a] += 1; degree[b] += 1
+            e = f
         }
+        keys = []
+        var start = [Int32](repeating: 0, count: n + 1)
+        for i in 0..<n { start[i + 1] = start[i] + degree[i] }
+        var cursor = start
+        var adjacent = [UInt32](repeating: 0, count: Int(start[n]))
+        for key in unique {
+            let a = Int(key >> 32), b = Int(key & 0xFFFF_FFFF)
+            adjacent[Int(cursor[a])] = UInt32(b); cursor[a] += 1
+            adjacent[Int(cursor[b])] = UInt32(a); cursor[b] += 1
+        }
+        unique = []; cursor = []; degree = []
         var p = m.positions
         func step(_ factor: Float) {
             var next = p
-            for i in 0..<n where !fixed[i] && !neighbours[i].isEmpty {
+            for i in 0..<n where !fixed[i] && start[i + 1] > start[i] {
                 var avg = SIMD3<Float>.zero
-                for j in neighbours[i] { avg += p[Int(j)] }
-                avg /= Float(neighbours[i].count)
+                for k in Int(start[i])..<Int(start[i + 1]) { avg += p[Int(adjacent[k])] }
+                avg /= Float(start[i + 1] - start[i])
                 next[i] = p[i] + factor * (avg - p[i])
             }
             p = next

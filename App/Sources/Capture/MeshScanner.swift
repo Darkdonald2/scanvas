@@ -9,7 +9,7 @@ import simd
 struct Keyframe {
     static let width = 256, height = 192
     var rgb: [UInt8]              // width × height × 3
-    var depth: [Float32]          // width × height, metres (empty if unavailable)
+    var depth: [Float16]          // width × height, metres (empty if unavailable); half precision keeps long scans in memory
     var worldToCamera: simd_float4x4
     var cameraPosition: SIMD3<Float>
     var fx: Float, fy: Float, cx: Float, cy: Float
@@ -39,7 +39,7 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
 
     let arView: ARView
     var captureColour = true
-    var maxKeyframes = 900
+    var maxKeyframes = 700
 
     private var keyframes: [Keyframe] = []
     private var lastKeyTransform: simd_float4x4?
@@ -75,6 +75,7 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
     private var fastSince: TimeInterval?, slowSince: TimeInterval?
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let photoQueue = DispatchQueue(label: "scanvas.photos", qos: .utility)
+    private let pendingPhotos = DispatchSemaphore(value: 3)
 
     static var isSupported: Bool { ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) }
 
@@ -212,21 +213,37 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
             guard now - lastKeyTime > 0.2, moved > 0.1 || turned > 0.1 else { return }
         }
         guard var kf = Self.makeKeyframe(frame) else { return }
+        // Only the anchors around what the camera looks at are needed to correct drift later; keeping every
+        // anchor for every photo grows into hundreds of megabytes on long scans.
+        let look = kf.cameraPosition - SIMD3(t.columns.2.x, t.columns.2.y, t.columns.2.z) * 1.5
         anchorLock.lock()
-        kf.anchorTransforms = meshAnchors.mapValues { $0.transform }
+        let near = meshAnchors.values.sorted {
+            simd_distance_squared(SIMD3($0.transform.columns.3.x, $0.transform.columns.3.y, $0.transform.columns.3.z), look)
+                < simd_distance_squared(SIMD3($1.transform.columns.3.x, $1.transform.columns.3.y, $1.transform.columns.3.z), look)
+        }.prefix(8)
         anchorLock.unlock()
+        kf.anchorTransforms = Dictionary(uniqueKeysWithValues: near.map { ($0.identifier, $0.transform) })
         // Skip motion-blurred frames unless it has been a while since the last photo.
         if sharpnessMean > 0 && kf.sharpness < sharpnessMean * 0.6 && now - lastKeyTime < 1.5 { return }
         sharpnessMean = sharpnessMean == 0 ? kf.sharpness : sharpnessMean * 0.9 + kf.sharpness * 0.1
         lastKeyTransform = t
         lastKeyTime = now
         do {
-            if let dir = photoDirectory, let cg = photo(from: frame) {
-                kf.photo = photoCount
-                let url = dir.appendingPathComponent(Keyframe.photoName(photoCount))
-                photoCount += 1
-                photoQueue.async {
-                    try? UIImage(cgImage: cg).jpegData(compressionQuality: 0.88)?.write(to: url)
+            // Each waiting photo is an 11 MB image, so never let more than a few queue up behind the encoder.
+            if let dir = photoDirectory, pendingPhotos.wait(timeout: .now()) == .success {
+                if let cg = photo(from: frame) {
+                    kf.photo = photoCount
+                    let url = dir.appendingPathComponent(Keyframe.photoName(photoCount))
+                    photoCount += 1
+                    let pending = pendingPhotos
+                    photoQueue.async {
+                        autoreleasepool {
+                            try? UIImage(cgImage: cg).jpegData(compressionQuality: 0.88)?.write(to: url)
+                        }
+                        pending.signal()
+                    }
+                } else {
+                    pendingPhotos.signal()
                 }
             }
             lock.lock()
@@ -342,17 +359,17 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
             }
         }
 
-        var depth: [Float32] = []
+        var depth: [Float16] = []
         if let dm = frame.sceneDepth?.depthMap ?? frame.smoothedSceneDepth?.depthMap,
            CVPixelBufferGetPixelFormatType(dm) == kCVPixelFormatType_DepthFloat32 {
             CVPixelBufferLockBaseAddress(dm, .readOnly)
             let dw = CVPixelBufferGetWidth(dm), dh = CVPixelBufferGetHeight(dm)
             let stride = CVPixelBufferGetBytesPerRow(dm)
             if let base = CVPixelBufferGetBaseAddress(dm) {
-                depth = [Float32](repeating: 0, count: w * h)
+                depth = [Float16](repeating: 0, count: w * h)
                 for j in 0..<h {
                     let row = (base + min(dh - 1, j * dh / h) * stride).assumingMemoryBound(to: Float32.self)
-                    for i in 0..<w { depth[j * w + i] = row[min(dw - 1, i * dw / w)] }
+                    for i in 0..<w { depth[j * w + i] = Float16(row[min(dw - 1, i * dw / w)]) }
                 }
             }
             CVPixelBufferUnlockBaseAddress(dm, .readOnly)
@@ -452,7 +469,7 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
                 guard u >= 0, v >= 0, u < Float(w - 1), v < Float(h - 1) else { continue }
                 let ui = Int(u), vi = Int(v)
                 if !kf.depth.isEmpty {
-                    let d = kf.depth[vi * w + ui]
+                    let d = Float(kf.depth[vi * w + ui])
                     if d > 0 && abs(d - z) > 0.04 + 0.02 * z { continue }
                 }
                 var facing: Float = 1

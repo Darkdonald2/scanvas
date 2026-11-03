@@ -39,12 +39,12 @@ enum Texturer {
             var nearest: Float = .greatestFiniteMagnitude
             for dy in -1...1 {
                 for dx in -1...1 {
-                    let d = f.depth[(vi + dy) * dw + ui + dx]
+                    let d = Float(f.depth[(vi + dy) * dw + ui + dx])
                     if d > 0 { nearest = min(nearest, d) }
                 }
             }
             if nearest < .greatestFiniteMagnitude && z - nearest > tol { return false }   // something in front
-            let d = f.depth[vi * dw + ui]
+            let d = Float(f.depth[vi * dw + ui])
             if d > 0 && d - z > 0.08 + 0.04 * z { return false }                          // surface not where the mesh says
             return true
         }
@@ -121,23 +121,39 @@ enum Texturer {
 
         // Pass 3: let each triangle follow its neighbours' photo when that photo also sees it well,
         // which removes small islands and most visible seams.
-        var edgeTris: [UInt64: [Int32]] = [:]
-        edgeTris.reserveCapacity(triCount * 2)
-        for t in 0..<triCount {
-            for j in 0..<3 {
-                let a = mesh.indices[3 * t + j], b = mesh.indices[3 * t + (j + 1) % 3]
-                edgeTris[UInt64(min(a, b)) << 32 | UInt64(max(a, b)), default: []].append(Int32(t))
+        // Neighbours across shared edges, from a sorted edge list: a dictionary of arrays here used several
+        // hundred megabytes on long scans. Three slots per triangle, −1 where there is no neighbour.
+        var adjacency = [Int32](repeating: -1, count: triCount * 3)
+        do {
+            var edges = [(UInt64, Int32)]()
+            edges.reserveCapacity(triCount * 3)
+            for t in 0..<triCount {
+                for j in 0..<3 {
+                    let a = mesh.indices[3 * t + j], b = mesh.indices[3 * t + (j + 1) % 3]
+                    edges.append((UInt64(min(a, b)) << 32 | UInt64(max(a, b)), Int32(t)))
+                }
+            }
+            edges.sort { $0.0 < $1.0 }
+            var fill = [UInt8](repeating: 0, count: triCount)
+            var i = 0
+            while i < edges.count {
+                var j = i + 1
+                while j < edges.count && edges[j].0 == edges[i].0 { j += 1 }
+                if j - i == 2 {
+                    let x = Int(edges[i].1), y = Int(edges[i + 1].1)
+                    if fill[x] < 3 && fill[y] < 3 {
+                        adjacency[3 * x + Int(fill[x])] = Int32(y); fill[x] += 1
+                        adjacency[3 * y + Int(fill[y])] = Int32(x); fill[y] += 1
+                    }
+                }
+                i = j
             }
         }
-        var adjacency = [[Int32]](repeating: [], count: triCount)
-        for (_, tris) in edgeTris where tris.count == 2 {
-            adjacency[Int(tris[0])].append(tris[1]); adjacency[Int(tris[1])].append(tris[0])
-        }
-        edgeTris = [:]
+        func neighbours(_ t: Int) -> ArraySlice<Int32> { adjacency[(3 * t)..<(3 * t + 3)] }
         for _ in 0..<8 {
-            for t in 0..<triCount where choice[t] >= 0 && !adjacency[t].isEmpty {
+            for t in 0..<triCount where choice[t] >= 0 && adjacency[3 * t] >= 0 {
                 var counts: [Int32: Int] = [:]
-                for nb in adjacency[Int(t)] where choice[Int(nb)] >= 0 { counts[choice[Int(nb)], default: 0] += 1 }
+                for nb in neighbours(t) where nb >= 0 && choice[Int(nb)] >= 0 { counts[choice[Int(nb)], default: 0] += 1 }
                 guard let top = counts.max(by: { $0.value < $1.value }), top.key != choice[t], top.value >= 2 else { continue }
                 if score(t, Int(top.key)) >= bestScore[t] * 0.35 { choice[t] = top.key }
             }
@@ -185,7 +201,7 @@ enum Texturer {
         }
         let compact = compactCharts
         for t in 0..<triCount where compact && choice[t] >= 0 {
-            for nb in adjacency[t] where choice[Int(nb)] == choice[t] {
+            for nb in neighbours(t) where nb >= 0 && choice[Int(nb)] == choice[t] {
                 let a = root(Int32(t)), b = root(nb)
                 if a != b { parent[Int(max(a, b))] = min(a, b) }
             }
@@ -337,7 +353,7 @@ enum Texturer {
                 guard u >= 1, v >= 1, u < Float(w - 1), v < Float(h - 1) else { continue }
                 let ui = Int(u), vi = Int(v)
                 if !f.depth.isEmpty {
-                    let d = f.depth[vi * w + ui]
+                    let d = Float(f.depth[vi * w + ui])
                     if d > 0 && abs(d - z) > 0.05 + 0.03 * z { continue }
                 }
                 let o = (vi * w + ui) * 3

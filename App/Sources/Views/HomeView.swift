@@ -13,6 +13,7 @@ struct HomeView: View {
     @State private var path: [ScanProject] = []
     @State private var showSettings = false
     @State private var unsupported: String?
+    @State private var unfinished = ProcessingMonitor.unfinished
 
     private let columns = [GridItem(.adaptive(minimum: 160), spacing: 14)]
 
@@ -66,6 +67,9 @@ struct HomeView: View {
         .alert("Not available on this device", isPresented: Binding(get: { unsupported != nil }, set: { if !$0 { unsupported = nil } })) {
             Button("OK", role: .cancel) {}
         } message: { Text(unsupported ?? "") }
+        .alert("The last scan didn't finish processing", isPresented: Binding(get: { unfinished != nil }, set: { if !$0 { unfinished = nil; ProcessingMonitor.end() } })) {
+            Button("OK", role: .cancel) {}
+        } message: { Text("The app closed while: \(unfinished ?? "")") }
     }
 
     private func open(_ project: ScanProject) {

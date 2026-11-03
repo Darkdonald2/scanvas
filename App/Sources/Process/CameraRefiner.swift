@@ -75,9 +75,9 @@ enum CameraRefiner {
         samples.reserveCapacity(1500)
         for v in stride(from: 4, to: h - 4, by: 5) {
             for u in stride(from: 4, to: w - 4, by: 5) {
-                let z = f.depth[v * w + u]
+                let z = Float(f.depth[v * w + u])
                 guard z > 0.3, z < 4.0 else { continue }
-                let n1 = f.depth[v * w + u - 2], n2 = f.depth[v * w + u + 2], n3 = f.depth[(v - 2) * w + u], n4 = f.depth[(v + 2) * w + u]
+                let n1 = Float(f.depth[v * w + u - 2]), n2 = Float(f.depth[v * w + u + 2]), n3 = Float(f.depth[(v - 2) * w + u]), n4 = Float(f.depth[(v + 2) * w + u])
                 let jump = max(abs(n1 - z), abs(n2 - z), abs(n3 - z), abs(n4 - z))
                 guard jump < 0.04 * z + 0.02 else { continue }
                 samples.append(SIMD3((Float(u) - f.cx) / f.fx * z, -(Float(v) - f.cy) / f.fy * z, -z))
