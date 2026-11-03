@@ -50,14 +50,16 @@ enum SpaceProcessing {
             log.append("photo keyframes: \(frames.count), memory \(ProcessingMonitor.footprintMB()) MB")
             if refine {
                 report("Refining cameras…", 0.1)
-                let before = frames
+                let before = frames.map { $0.worldToCamera }
                 frames = CameraRefiner.refine(frames, mesh: mesh) { p in
                     report("Refining cameras…", 0.1 + 0.1 * p)
                 }
-                let changed = zip(before, frames).filter { $0.0.worldToCamera != $0.1.worldToCamera }.count
+                let changed = zip(before, frames).filter { $0.0 != $0.1.worldToCamera }.count
                 log.append("refined cameras: \(changed) of \(frames.count)")
             }
-            let textured = try Texturer.build(mesh: mesh, keyframes: frames, photos: photos, output: folder) { p in
+            // The scanner's copy is no longer needed; dropping it lets the texturer free the images as it goes.
+            scanner.clearKeyframes()
+            let textured = try Texturer.build(mesh: mesh, keyframes: &frames, photos: photos, output: folder) { p in
                 report(p.message, 0.2 + 0.76 * p.fraction)
             }
             log.append("texturing: " + Texturer.lastStats + ", memory \(ProcessingMonitor.footprintMB()) MB")

@@ -1,6 +1,8 @@
 import Foundation
 import UIKit
 import CoreImage
+import ImageIO
+import UniformTypeIdentifiers
 import simd
 
 /// Builds photo textures for a scanned mesh: every triangle takes its pixels from the photo
@@ -17,9 +19,11 @@ enum Texturer {
     /// Crop each photo around the connected patches it covers (true) or around everything it covers (false).
     static var compactCharts: Bool { UserDefaults.standard.object(forKey: "compactTextures") as? Bool ?? true }
 
-    static func build(mesh: MeshData, keyframes: [Keyframe], photos: URL, output folder: URL,
+    /// `keyframes` is emptied once their small images and depth are no longer needed, so that memory is free
+    /// before the large texture pages are drawn.
+    static func build(mesh: MeshData, keyframes: inout [Keyframe], photos: URL, output folder: URL,
                       progress: (Progress) -> Void) throws -> TexturedMesh {
-        let frames = keyframes.filter { FileManager.default.fileExists(atPath: photos.appendingPathComponent(Keyframe.photoName($0.photo)).path) }
+        var frames = keyframes.filter { FileManager.default.fileExists(atPath: photos.appendingPathComponent(Keyframe.photoName($0.photo)).path) }
         let triCount = mesh.triangleCount
         guard !frames.isEmpty, triCount > 0 else { return TexturedMesh() }
         let W = Float(Keyframe.photoWidth), H = Float(Keyframe.photoHeight)
@@ -176,6 +180,9 @@ enum Texturer {
         // Exposure: a brightness/colour gain per photo so neighbouring photos match.
         progress(Progress(message: "Matching photo brightness…", fraction: 0.66))
         let gains = exposureGains(mesh: mesh, frames: frames)
+        // From here on only the camera poses are needed.
+        keyframes = []
+        frames = frames.map { var f = $0; f.rgb = []; f.depth = []; return f }
 
         progress(Progress(message: "Packing photo textures…", fraction: 0.7))
 
@@ -259,42 +266,57 @@ enum Texturer {
         while !pack() { scale *= 0.9 }
         lastStats = "photos \(frames.count), crops \(crops.count), pages \(pages), scale \(String(format: "%.2f", Double(scale))), untextured \(untextured.count) of \(triCount)"
 
-        // Draw the pages.
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = 1
-        format.opaque = true
-        let ci = CIContext(options: [.cacheIntermediates: false])
+        // Draw the pages into one reused bitmap and write each straight to disk. (Making a fresh image per page,
+        // plus Core Image copies for the brightness fix, kept every page in memory and closed the app on long scans.)
+        let side = pageSize
+        guard let ctx = CGContext(data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: side * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
+              let pixels = ctx.data?.assumingMemoryBound(to: UInt8.self) else { throw CocoaError(.fileWriteUnknown) }
+        ctx.interpolationQuality = .high
+        let rowBytes = ctx.bytesPerRow
         for p in 0..<pages {
             progress(Progress(message: "Encoding texture \(p + 1) of \(pages)…", fraction: 0.75 + 0.2 * Double(p) / Double(pages)))
             try autoreleasepool {
-                let image = UIGraphicsImageRenderer(size: CGSize(width: page, height: page), format: format).image { ctx in
-                    UIColor(white: 0.5, alpha: 1).setFill()
-                    ctx.fill(CGRect(x: 0, y: 0, width: page, height: page))
-                    let onPage = crops.filter { $0.page == p }
-                    let byFrame = Dictionary(grouping: onPage, by: { $0.frame })
-                    for (fi, list) in byFrame {
-                        autoreleasepool {
-                            let url = photos.appendingPathComponent(Keyframe.photoName(frames[fi].photo))
-                            guard var photo = UIImage(contentsOfFile: url.path)?.cgImage else { return }
-                            let g = gains[fi]
-                            if abs(g.x - 1) + abs(g.y - 1) + abs(g.z - 1) > 0.02 {
-                                let image = CIImage(cgImage: photo).applyingFilter("CIColorMatrix", parameters: [
-                                    "inputRVector": CIVector(x: CGFloat(g.x), y: 0, z: 0, w: 0),
-                                    "inputGVector": CIVector(x: 0, y: CGFloat(g.y), z: 0, w: 0),
-                                    "inputBVector": CIVector(x: 0, y: 0, z: CGFloat(g.z), w: 0),
-                                ])
-                                if let adjusted = ci.createCGImage(image, from: image.extent) { photo = adjusted }
-                            }
-                            for crop in list {
-                                guard let part = photo.cropping(to: crop.rect) else { continue }
-                                UIImage(cgImage: part).draw(in: CGRect(x: crop.origin.x, y: crop.origin.y,
-                                                                       width: crop.rect.width * scale, height: crop.rect.height * scale))
+                ctx.setFillColor(gray: 0.5, alpha: 1)
+                ctx.fill(CGRect(x: 0, y: 0, width: side, height: side))
+                let byFrame = Dictionary(grouping: crops.filter { $0.page == p }, by: { $0.frame })
+                for (fi, list) in byFrame {
+                    autoreleasepool {
+                        let url = photos.appendingPathComponent(Keyframe.photoName(frames[fi].photo))
+                        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                              let photo = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
+                        else { return }
+                        let g = gains[fi]
+                        let adjust = abs(g.x - 1) + abs(g.y - 1) + abs(g.z - 1) > 0.02
+                        let gr = Int(g.x * 256), gg = Int(g.y * 256), gb = Int(g.z * 256)
+                        for crop in list {
+                            guard let part = photo.cropping(to: crop.rect) else { continue }
+                            let w = crop.rect.width * scale, h = crop.rect.height * scale
+                            // Bitmap rows run top-down in memory, drawing coordinates bottom-up.
+                            ctx.draw(part, in: CGRect(x: crop.origin.x, y: CGFloat(side) - crop.origin.y - h, width: w, height: h))
+                            guard adjust else { continue }
+                            let x0 = max(0, Int(crop.origin.x.rounded(.down))), x1 = min(side, Int((crop.origin.x + w).rounded(.up)))
+                            let y0 = max(0, Int(crop.origin.y.rounded(.down))), y1 = min(side, Int((crop.origin.y + h).rounded(.up)))
+                            guard x1 > x0, y1 > y0 else { continue }
+                            for y in y0..<y1 {
+                                let row = pixels + y * rowBytes
+                                for x in x0..<x1 {
+                                    let o = x * 4
+                                    row[o] = UInt8(min(255, Int(row[o]) * gr >> 8))
+                                    row[o + 1] = UInt8(min(255, Int(row[o + 1]) * gg >> 8))
+                                    row[o + 2] = UInt8(min(255, Int(row[o + 2]) * gb >> 8))
+                                }
                             }
                         }
                     }
                 }
-                guard let data = image.jpegData(compressionQuality: 0.9) else { throw CocoaError(.fileWriteUnknown) }
-                try data.write(to: folder.appendingPathComponent(TexturedMesh.textureName(p)), options: .atomic)
+                let url = folder.appendingPathComponent(TexturedMesh.textureName(p))
+                try? FileManager.default.removeItem(at: url)
+                guard let image = ctx.makeImage(),
+                      let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil)
+                else { throw CocoaError(.fileWriteUnknown) }
+                CGImageDestinationAddImage(dest, image, [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary)
+                guard CGImageDestinationFinalize(dest) else { throw CocoaError(.fileWriteUnknown) }
             }
         }
 
