@@ -302,9 +302,9 @@ enum Texturer {
                                 let row = pixels + y * rowBytes
                                 for x in x0..<x1 {
                                     let o = x * 4
-                                    row[o] = UInt8(min(255, Int(row[o]) * gr >> 8))
-                                    row[o + 1] = UInt8(min(255, Int(row[o + 1]) * gg >> 8))
-                                    row[o + 2] = UInt8(min(255, Int(row[o + 2]) * gb >> 8))
+                                    row[o] = UInt8(min(255, (Int(row[o]) * gr) >> 8))
+                                    row[o + 1] = UInt8(min(255, (Int(row[o + 1]) * gg) >> 8))
+                                    row[o + 2] = UInt8(min(255, (Int(row[o + 2]) * gb) >> 8))
                                 }
                             }
                         }
