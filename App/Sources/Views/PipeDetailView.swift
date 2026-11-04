@@ -26,6 +26,7 @@ struct PipeDetailView: View {
     @State private var thumbs: [Int: UIImage] = [:]
     @State private var selectedPhoto: PhotoSelection?
     @State private var showExport = false
+    @State private var showRawTransfer = false
     @State private var showAlign = false
     @State private var renaming = false
     @State private var newName = ""
@@ -76,12 +77,16 @@ struct PipeDetailView: View {
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
+                    if RawPackage.exists(for: current) {
+                        Button { showRawTransfer = true } label: { Label("Send to computer", systemImage: "desktopcomputer") }
+                    }
                     Button { showAlign = true } label: { Label("Align to drawing", systemImage: "scope") }
                     Button { newName = current.name; renaming = true } label: { Label("Rename", systemImage: "pencil") }
                     Button(role: .destructive) { confirmDelete = true } label: { Label("Delete", systemImage: "trash") }
                 } label: { Image(systemName: "ellipsis.circle") }
             }
         }
+        .sheet(isPresented: $showRawTransfer) { RawTransferView(project: current) }
         .sheet(isPresented: $showExport) {
             ExportView(project: current, sectionHeight: 1.2).environmentObject(store)
         }

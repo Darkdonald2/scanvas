@@ -33,6 +33,12 @@ targets:
         NSCameraUsageDescription: Scanvas uses the camera and LiDAR sensor to scan rooms, spaces and objects.
         NSPhotoLibraryUsageDescription: Scanvas reads the photos you pick so it can turn them into 3D models.
         NSPhotoLibraryAddUsageDescription: Scanvas saves snapshots of your scans to your photo library.
+        NSLocalNetworkUsageDescription: Scanvas finds Scanvas Studio on your computer and sends raw scans to it over Wi-Fi.
+        NSBonjourServices:
+          - _scanvas._tcp
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSAllowsArbitraryLoads: true
     settings:
       base:
         # Change "yourname" to something unique to you before running on an iPhone.

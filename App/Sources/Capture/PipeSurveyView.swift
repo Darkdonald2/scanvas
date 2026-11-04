@@ -311,7 +311,11 @@ struct PipeSurveyView: View {
         scanner.captureColour = captureColour
         scanner.lockExposure = lockExposure
         scanner.showMesh = showMesh
-        if captureColour {
+        if RawRecorder.enabled {
+            // Raw capture: the computer does the photo texturing, so the phone only colours its preview.
+            scanner.raw = try? RawRecorder(folder: folder.appendingPathComponent(RawRecorder.folderName, isDirectory: true))
+        }
+        if captureColour && scanner.raw == nil {
             let photos = folder.appendingPathComponent(ProjectFile.keyframes, isDirectory: true)
             try? FileManager.default.createDirectory(at: photos, withIntermediateDirectories: true)
             scanner.photoDirectory = photos
@@ -345,6 +349,10 @@ struct PipeSurveyView: View {
             var survey = base
             func report(_ text: String, _ value: Double) {
                 Task { @MainActor in status = text; progress = value }
+            }
+            if let raw = scanner.raw {
+                report("Saving raw capture…", 0.005)
+                raw.finish(anchors: scanner.anchorTransforms(), mesh: collected, kind: "pipe")
             }
             do {
                 try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

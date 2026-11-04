@@ -40,6 +40,10 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
     let arView: ARView
     var captureColour = true
     var maxKeyframes = 700
+    /// Raw capture for computer processing (nil when off).
+    var raw: RawRecorder?
+    @Published var rawFrames = 0
+    @Published var rawBytes: Int64 = 0
 
     private var keyframes: [Keyframe] = []
     private var lastKeyTransform: simd_float4x4?
@@ -106,6 +110,10 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
         }
         config.environmentTexturing = .none
         config.worldAlignment = .gravity
+        // Raw capture at 4K: sharper photos for computer processing, where the device supports it.
+        if raw != nil && RawRecorder.use4K, let format = ARWorldTrackingConfiguration.recommendedVideoFormatFor4KResolution {
+            config.videoFormat = format
+        }
         arView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
         startTime = Date()
         isScanning = true
@@ -181,6 +189,9 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
         let now = frame.timestamp
         frameHandler?(frame)
         trackSpeed(frame.camera.transform, now)
+        if isScanning, let raw {
+            raw.consider(frame) { nearbyAnchors(frame.camera.transform) }
+        }
         if lockExposure && !exposureLocked && isScanning {
             if case .normal = frame.camera.trackingState {
                 if normalSince == nil { normalSince = now }
@@ -196,7 +207,10 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
             anchorLock.unlock()
             let message = Self.message(for: frame.camera.trackingState)
             let kf = keyframes.count
+            let rf = raw?.frameCount ?? 0, rb = raw?.bytes ?? 0
             DispatchQueue.main.async {
+                self.rawFrames = rf
+                self.rawBytes = rb
                 self.triangleCount = tris
                 self.trackingMessage = message
                 self.keyframeCount = kf
@@ -213,16 +227,7 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
             guard now - lastKeyTime > 0.2, moved > 0.1 || turned > 0.1 else { return }
         }
         guard var kf = Self.makeKeyframe(frame) else { return }
-        // Only the anchors around what the camera looks at are needed to correct drift later; keeping every
-        // anchor for every photo grows into hundreds of megabytes on long scans.
-        let look = kf.cameraPosition - SIMD3(t.columns.2.x, t.columns.2.y, t.columns.2.z) * 1.5
-        anchorLock.lock()
-        let near = meshAnchors.values.sorted {
-            simd_distance_squared(SIMD3($0.transform.columns.3.x, $0.transform.columns.3.y, $0.transform.columns.3.z), look)
-                < simd_distance_squared(SIMD3($1.transform.columns.3.x, $1.transform.columns.3.y, $1.transform.columns.3.z), look)
-        }.prefix(8)
-        anchorLock.unlock()
-        kf.anchorTransforms = Dictionary(uniqueKeysWithValues: near.map { ($0.identifier, $0.transform) })
+        kf.anchorTransforms = nearbyAnchors(t)
         // Skip motion-blurred frames unless it has been a while since the last photo.
         if sharpnessMean > 0 && kf.sharpness < sharpnessMean * 0.6 && now - lastKeyTime < 1.5 { return }
         sharpnessMean = sharpnessMean == 0 ? kf.sharpness : sharpnessMean * 0.9 + kf.sharpness * 0.1
@@ -255,6 +260,25 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
             }
             lock.unlock()
         }
+    }
+
+    /// The anchors around what the camera looks at: enough to correct drift later. (Keeping every anchor for
+    /// every photo grows into hundreds of megabytes on long scans.)
+    func nearbyAnchors(_ t: simd_float4x4) -> [UUID: simd_float4x4] {
+        let look = SIMD3(t.columns.3.x, t.columns.3.y, t.columns.3.z) - SIMD3(t.columns.2.x, t.columns.2.y, t.columns.2.z) * 1.5
+        anchorLock.lock()
+        let near = meshAnchors.values.sorted {
+            simd_distance_squared(SIMD3($0.transform.columns.3.x, $0.transform.columns.3.y, $0.transform.columns.3.z), look)
+                < simd_distance_squared(SIMD3($1.transform.columns.3.x, $1.transform.columns.3.y, $1.transform.columns.3.z), look)
+        }.prefix(8)
+        anchorLock.unlock()
+        return Dictionary(uniqueKeysWithValues: near.map { ($0.identifier, $0.transform) })
+    }
+
+    /// Every mesh anchor's current pose.
+    func anchorTransforms() -> [UUID: simd_float4x4] {
+        anchorLock.lock(); defer { anchorLock.unlock() }
+        return meshAnchors.mapValues { $0.transform }
     }
 
     /// The camera image at full resolution (same framing as the keyframe).

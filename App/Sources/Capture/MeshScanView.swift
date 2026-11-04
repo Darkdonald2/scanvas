@@ -35,6 +35,10 @@ struct MeshScanView: View {
                     VStack(alignment: .trailing, spacing: 2) {
                         Text("\(scanner.triangleCount.formatted()) triangles").font(.footnote.monospacedDigit().weight(.semibold))
                         Text(timeText).font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                        if scanner.raw != nil {
+                            Text("Raw · \(scanner.rawFrames) photos · \(ByteCountFormatter.string(fromByteCount: scanner.rawBytes, countStyle: .file))")
+                                .font(.caption2.monospacedDigit()).foregroundStyle(.green)
+                        }
                     }
                     .padding(.horizontal, 10).padding(.vertical, 6)
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
@@ -78,7 +82,11 @@ struct MeshScanView: View {
             scanner.captureColour = captureColour
             scanner.lockExposure = lockExposure
             project.name = store.nextName(for: .space)
-            if captureColour {
+            if RawRecorder.enabled {
+                // Raw capture: the computer does the photo texturing, so the phone only colours its preview.
+                scanner.raw = try? RawRecorder(folder: ProjectStore.folder(for: project.id).appendingPathComponent(RawRecorder.folderName, isDirectory: true))
+            }
+            if captureColour && scanner.raw == nil {
                 let photos = ProjectStore.folder(for: project.id).appendingPathComponent(ProjectFile.keyframes, isDirectory: true)
                 try? FileManager.default.createDirectory(at: photos, withIntermediateDirectories: true)
                 scanner.photoDirectory = photos
@@ -118,6 +126,10 @@ struct MeshScanView: View {
             let folder = ProjectStore.folder(for: project.id)
             func report(_ text: String, _ value: Double) {
                 Task { @MainActor in status = text; progress = value }
+            }
+            if let raw = scanner.raw {
+                report("Saving raw capture…", 0.005)
+                raw.finish(anchors: scanner.anchorTransforms(), mesh: collected, kind: "space")
             }
             do {
                 let (mesh, thumbScene) = try SpaceProcessing.process(collected, scanner: scanner, folder: folder,

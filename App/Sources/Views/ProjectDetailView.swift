@@ -26,6 +26,7 @@ struct ProjectDetailView: View {
     @State private var measuring = false
     @State private var measured: Float?
     @State private var showExport = false
+    @State private var showRawTransfer = false
     @State private var renaming = false
     @State private var newName = ""
     @State private var confirmDelete = false
@@ -70,11 +71,15 @@ struct ProjectDetailView: View {
                             processingInfo = (try? String(contentsOf: store.url("processing.txt", in: current), encoding: .utf8)) ?? ""
                         } label: { Label("Processing details", systemImage: "info.circle") }
                     }
+                    if RawPackage.exists(for: current) {
+                        Button { showRawTransfer = true } label: { Label("Send to computer", systemImage: "desktopcomputer") }
+                    }
                     Button { newName = current.name; renaming = true } label: { Label("Rename", systemImage: "pencil") }
                     Button(role: .destructive) { confirmDelete = true } label: { Label("Delete", systemImage: "trash") }
                 } label: { Image(systemName: "ellipsis.circle") }
             }
         }
+        .sheet(isPresented: $showRawTransfer) { RawTransferView(project: current) }
         .sheet(isPresented: $showExport) {
             ExportView(project: current, sectionHeight: Float(sectionHeight)).environmentObject(store)
         }
