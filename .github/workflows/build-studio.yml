@@ -39,9 +39,7 @@ jobs:
         run: |
           pyinstaller --noconfirm --clean --name "Scanvas Studio" --windowed \
             --collect-all open3d --collect-submodules zeroconf --hidden-import scanvas_studio.app \
-            --exclude-module dash --exclude-module plotly --exclude-module jedi --exclude-module IPython \
-            --exclude-module matplotlib --exclude-module pandas --exclude-module open3d.ml \
-            --exclude-module torch --exclude-module tensorflow \
+            --exclude-module open3d.ml --exclude-module torch --exclude-module tensorflow \
             run_studio.py
       - name: Check the packaged app runs
         run: |
