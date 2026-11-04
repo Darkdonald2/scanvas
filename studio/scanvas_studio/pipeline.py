@@ -35,6 +35,7 @@ class Settings:
     z_up: bool = False             # rotate so Z is up (Revit, AutoCAD, Rhino)
     max_depth: float = 4.5         # metres: LiDAR gets noisy further away
     min_confidence: int = 1        # 0 low, 1 medium, 2 high
+    texture_limit: int = 0         # override for the texturing triangle budget (0 = quality default)
 
     @property
     def voxel(self) -> float:
@@ -54,6 +55,8 @@ class Settings:
 
     @property
     def texture_triangles(self) -> int:
+        if self.texture_limit:
+            return self.texture_limit
         return {"fast": 200_000, "high": 600_000, "ultra": 1_200_000}[self.quality]
 
 
@@ -248,6 +251,23 @@ def clean(mesh, s: Settings, report: Report):
 
 # ---------------------------------------------------------------------------------------------- texturing
 
+def make_manifold(mesh, rounds: int = 6):
+    """Unwrapping needs a clean surface: no edge shared by more than two triangles and no vertex where separate
+    sheets touch. Simplifying a big scan creates a few of those; cut them out (a handful of triangles)."""
+    for _ in range(rounds):
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_duplicated_vertices()
+        mesh.remove_non_manifold_edges()
+        bad = np.asarray(mesh.get_non_manifold_vertices())
+        if len(bad):
+            mesh.remove_vertices_by_index(bad.tolist())
+        mesh.remove_unreferenced_vertices()
+        if mesh.is_edge_manifold() and mesh.is_vertex_manifold():
+            break
+    return mesh
+
+
 def texture(mesh, frames: list[Frame], s: Settings, report: Report, base: float, span: float):
     """Returns a tensor mesh with UVs and an albedo texture, or None when it can't be done."""
     o3d = _o3d()
@@ -257,10 +277,16 @@ def texture(mesh, frames: list[Frame], s: Settings, report: Report, base: float,
         report(f"Texturing: simplifying to {s.texture_triangles:,} triangles", base)
         work = work.simplify_quadric_decimation(s.texture_triangles)
         work.remove_unreferenced_vertices()
-        work.compute_vertex_normals()
+    work = make_manifold(work)
+    work.compute_vertex_normals()
     t = o3d.t.geometry.TriangleMesh.from_legacy(work)
     report("Texturing: unwrapping the surface (this can take a few minutes)", base + span * 0.03)
-    t.compute_uvatlas(size=s.texture_size, gutter=2.0, max_stretch=0.16, parallel_partitions=8, nthreads=0)
+    try:
+        t.compute_uvatlas(size=s.texture_size, gutter=2.0, max_stretch=0.16, parallel_partitions=8, nthreads=0)
+    except RuntimeError:
+        # Splitting into parallel parts can itself leave a tangled spot; unwrap in one piece instead (slower).
+        t = o3d.t.geometry.TriangleMesh.from_legacy(make_manifold(work, 12))
+        t.compute_uvatlas(size=s.texture_size, gutter=2.0, max_stretch=0.16, parallel_partitions=1, nthreads=0)
     V = t.vertex.positions.numpy().astype(np.float64)
     F = t.triangle.indices.numpy().astype(np.int64)
     UV = t.triangle.texture_uvs.numpy().astype(np.float64)
@@ -372,12 +398,20 @@ def process(capture: Capture, out: Path, s: Settings, report: Report) -> dict:
     log["clean_triangles"] = len(mesh.triangles)
     textured = None
     if s.texture:
-        try:
-            textured = texture(mesh, frames, s, report, 0.64, 0.3)
-            log.update(textured["stats"])
-        except Exception as e:   # e.g. out of memory on a huge scan: still deliver the coloured mesh
-            log["texture_error"] = str(e)
-            textured = None
+        # If unwrapping fails on a huge or tangled surface, try again with a lighter mesh before giving up.
+        budget = s.texture_triangles
+        for attempt in range(3):
+            try:
+                ts = Settings(**{**asdict(s), "texture_limit": budget})
+                textured = texture(mesh, frames, ts, report, 0.64, 0.3)
+                log.update(textured["stats"])
+                log.pop("texture_error", None)
+                break
+            except Exception as e:   # e.g. out of memory: still deliver the coloured mesh
+                log["texture_error"] = str(e)
+                textured = None
+                budget //= 2
+                report(f"Texturing: trying again with {budget:,} triangles", 0.64)
     files = export(out, mesh, textured, s, report)
     log["files"] = [f.name for f in files]
     log["minutes"] = round((time.time() - start) / 60, 1)
