@@ -16,6 +16,10 @@ jobs:
         include:
           - os: macos-14
             asset: ScanvasStudio-mac-apple-silicon.zip
+          - os: macos-15-intel
+            asset: ScanvasStudio-mac-intel.zip
+            # Open3D's newest release has no Intel Mac build; 0.19 does.
+            open3d: open3d==0.19.0
           - os: windows-latest
             asset: ScanvasStudio-windows.zip
     runs-on: ${{ matrix.os }}
@@ -29,7 +33,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install
-        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pyinstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller ${{ matrix.open3d }}
+          python -c "import open3d, platform; print(open3d.__version__, platform.machine())"
       - name: Test on a synthetic scan
         run: |
           python tests/make_synthetic.py "$RUNNER_TEMP/synth" 30
