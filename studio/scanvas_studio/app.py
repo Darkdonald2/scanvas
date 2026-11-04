@@ -101,6 +101,9 @@ class StudioApp:
         ttk.Button(actions, text="Open raw zip…", command=self.open_zip).pack(side="left")
         ttk.Button(actions, text="Open raw folder…", command=self.open_dir).pack(side="left", padx=8)
         ttk.Button(actions, text="Show results folder", command=lambda: open_folder(studio_home() / "Scans")).pack(side="right")
+        self.view_button = ttk.Button(actions, text="View 3D", command=self.view_last, state="disabled")
+        self.view_button.pack(side="right", padx=8)
+        self.last_out: Path | None = None
 
         # Progress and log
         self.step = ttk.Label(root, text="Ready.")
@@ -142,10 +145,13 @@ class StudioApp:
                     self.wifi_status.configure(text=value)
                 elif kind == "done":
                     folder, log = value
+                    self.last_out = folder
+                    self.view_button.configure(state="normal")
                     self.say(f"Finished in {log.get('minutes', '?')} min: {', '.join(log.get('files', []))}")
                     if "texture_error" in log:
                         self.say("Texturing failed (" + log["texture_error"] + "); the coloured mesh was still saved.")
                     self.wifi_status.configure(text=f"Waiting for scans at {self.receiver.address}")
+                    self.say("Click View 3D to look at it here. Scans sent over Wi-Fi can be fetched on the iPhone: Send to computer › Get processed model.")
                     open_folder(folder)
                 elif kind == "error":
                     self.step.configure(text="Something went wrong.")
@@ -170,16 +176,29 @@ class StudioApp:
         if path:
             self.queue_job(Path(path), Path(path).name)
 
-    def received(self, folder: Path, name: str):
+    def view_last(self):
+        if not self.last_out:
+            return
+        target = self.last_out / "model_textured.obj"
+        if not target.exists():
+            target = self.last_out / "model_dense_colour.ply"
+        # A separate process, so the 3D window can't freeze Studio.
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "--view", str(target)]
+        else:
+            cmd = [sys.executable, str(Path(__file__).resolve().parent.parent / "run_studio.py"), "--view", str(target)]
+        subprocess.Popen(cmd)
+
+    def received(self, folder: Path, name: str, transfer: str = ""):
         self.events.put(("log", f"Received “{name}” from the iPhone."))
         self.events.put(("wifi", f"Received {name}"))
         if self.auto.get():
-            self.queue_job(folder, name)
+            self.queue_job(folder, name, transfer)
         else:
             self.events.put(("log", f"Saved to {folder}. Open it with “Open raw folder…” when you're ready."))
 
-    def queue_job(self, path: Path, name: str):
-        self.jobs.put((path, name, self.settings()))
+    def queue_job(self, path: Path, name: str, transfer: str = ""):
+        self.jobs.put((path, name, self.settings(), transfer))
         self.events.put(("log", f"Queued “{name}”."))
 
     # ------------------------------------------------------------------ processing
@@ -187,7 +206,7 @@ class StudioApp:
         from .capture import Capture
         from .pipeline import process
         while True:
-            path, name, s = self.jobs.get()
+            path, name, s, transfer = self.jobs.get()
             cap = None
             try:
                 self.events.put(("step", (f"Opening {name}…", 0)))
@@ -198,20 +217,25 @@ class StudioApp:
                     out = out.with_name(f"{cap.name} - model ({n})")
                     n += 1
                 self.events.put(("log", f"Processing “{cap.name}”: {len(cap.frames)} photos with depth, {s.quality} quality."))
+                self.receiver.set_status(transfer, state="processing", folder=str(out))
                 last = [""]
 
                 def report(msg, frac):
                     self.events.put(("step", (msg, frac)))
+                    self.receiver.set_status(transfer, step=msg, progress=frac)
                     head = msg.split(" (")[0]
                     if head != last[0]:
                         last[0] = head
                         self.events.put(("log", "  " + head))
 
                 log = process(cap, out, s, report)
+                self.receiver.set_status(transfer, state="done", step="Done", progress=1.0)
                 self.events.put(("done", (out, log)))
             except MemoryError:
+                self.receiver.set_status(transfer, state="failed", step="The computer ran out of memory")
                 self.events.put(("error", "The computer ran out of memory. Try Fast quality, or close other apps."))
             except Exception as e:
+                self.receiver.set_status(transfer, state="failed", step=str(e))
                 self.events.put(("log", traceback.format_exc()))
                 self.events.put(("error", str(e)))
             finally:

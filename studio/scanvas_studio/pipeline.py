@@ -313,11 +313,36 @@ def export(out: Path, dense, textured, s: Settings, report: Report) -> list[Path
         p = out / "model_textured.glb"
         write_glb(p, V, textured["F"], textured["UV"], N, jpeg)
         files.append(p)
+        if s.z_up:
+            # The phone works in its own Y-up coordinates, so it gets an unrotated copy.
+            p = out / "phone_model.glb"
+            write_glb(p, textured["V"], textured["F"], textured["UV"], textured["normals"], jpeg)
+            files.append(p)
     else:
         p = out / "model_dense_colour.obj"
         o3d.io.write_triangle_mesh(str(p), dense)
         files.append(p)
     return files
+
+
+def phone_model(out: Path) -> Path | None:
+    """The model to send back to the iPhone (always in the phone's Y-up coordinates)."""
+    for name in ("phone_model.glb", "model_textured.glb"):
+        if (out / name).exists():
+            return out / name
+    return None
+
+
+def view(path: Path):
+    """Opens a result in a 3D window (drag to turn, scroll to zoom)."""
+    o3d = _o3d()
+    obj = path.with_name("model_textured.obj") if path.suffix == ".glb" else path
+    if not obj.exists():
+        obj = path.with_name("model_dense_colour.ply")
+    mesh = o3d.io.read_triangle_mesh(str(obj), enable_post_processing=True)
+    mesh.compute_vertex_normals()
+    o3d.visualization.draw_geometries([mesh], window_name="Scanvas Studio · " + path.parent.name,
+                                      width=1280, height=800, mesh_show_back_face=True)
 
 
 # ---------------------------------------------------------------------------------------------- whole run

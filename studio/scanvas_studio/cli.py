@@ -17,8 +17,14 @@ def main(argv=None):
     ap.add_argument("--no-smooth", action="store_true")
     ap.add_argument("--no-texture", action="store_true", help="coloured mesh only")
     ap.add_argument("--z-up", action="store_true", help="Z up instead of Y up (Revit, AutoCAD, Rhino)")
-    ap.add_argument("--serve", action="store_true", help="receive scans from the iPhone over Wi-Fi without a window")
+    ap.add_argument("--serve", action="store_true", help="receive and process scans from the iPhone over Wi-Fi without a window")
+    ap.add_argument("--view", help="open a result (.obj, .glb or results folder) in a 3D window")
     a = ap.parse_args(argv)
+    if a.view:
+        from .pipeline import view
+        p = Path(a.view)
+        view(p / "model_textured.obj" if p.is_dir() else p)
+        return 0
     if a.serve:
         from .server import run_forever
         run_forever()

@@ -86,7 +86,7 @@ struct PipeDetailView: View {
                 } label: { Image(systemName: "ellipsis.circle") }
             }
         }
-        .sheet(isPresented: $showRawTransfer) { RawTransferView(project: current) }
+        .sheet(isPresented: $showRawTransfer, onDismiss: { Task { await load() } }) { RawTransferView(project: current) }
         .sheet(isPresented: $showExport) {
             ExportView(project: current, sectionHeight: 1.2).environmentObject(store)
         }

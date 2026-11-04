@@ -1,5 +1,22 @@
 import SwiftUI
 import Network
+import UniformTypeIdentifiers
+
+/// Where a scan was sent, so its processed model can be fetched back later.
+struct StudioLink: Codable {
+    var host: String
+    var port: Int
+    var transfer: String
+    var code: String
+    var computer: String
+
+    static func url(_ package: RawPackage) -> URL { package.folder.appendingPathComponent("studio-link.json") }
+    static func load(_ package: RawPackage) -> StudioLink? {
+        (try? Data(contentsOf: url(package))).flatMap { try? JSONDecoder().decode(StudioLink.self, from: $0) }
+    }
+    func save(_ package: RawPackage) { try? JSONEncoder().encode(self).write(to: Self.url(package)) }
+    var base: String { "http://\(host):\(port)" }
+}
 
 /// The raw capture saved with a scan, ready to go to Scanvas Studio.
 struct RawPackage {
@@ -34,7 +51,7 @@ struct RawPackage {
         let base = folder.standardizedFileURL.path + "/"
         for case let url as URL in e {
             let v = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
-            guard v?.isRegularFile == true else { continue }
+            guard v?.isRegularFile == true, url.lastPathComponent != "studio-link.json" else { continue }
             out.append((String(url.standardizedFileURL.path.dropFirst(base.count)), Int64(v?.fileSize ?? 0)))
         }
         return out
@@ -153,6 +170,7 @@ final class StudioSender: ObservableObject {
                 let (_, r) = try await URLSession.shared.data(for: finish)
                 try check(r)
                 status = "Sent. Scanvas Studio is processing it now."
+                StudioLink(host: computer.host, port: computer.port, transfer: transfer, code: code, computer: computer.name).save(package)
                 done = true
             } catch is CancellationError {
                 status = "Cancelled"
@@ -189,6 +207,14 @@ struct RawTransferView: View {
     @State private var zipError: String?
     @State private var size: Int64 = 0
     @State private var frames = 0
+    @State private var link: StudioLink?
+    @State private var resultState = ""
+    @State private var resultStep = ""
+    @State private var resultProgress: Double = 0
+    @State private var fetching = false
+    @State private var imported: String?
+    @State private var importError: String?
+    @State private var pickingFile = false
 
     private var package: RawPackage { RawPackage(project: project) }
 
@@ -230,6 +256,35 @@ struct RawTransferView: View {
                 } header: { Text("Send over Wi-Fi") } footer: {
                     Text("Open Scanvas Studio on the computer, keep this phone unlocked, and stay on the same Wi-Fi.")
                 }
+                if link != nil || imported != nil {
+                    Section {
+                        if let link {
+                            LabeledContent("Sent to", value: link.computer)
+                            if resultState == "done" {
+                                Button { fetch() } label: {
+                                    if fetching { HStack { ProgressView(); Text("Downloading…") } } else { Label("Get processed model", systemImage: "arrow.down.circle.fill") }
+                                }
+                                .disabled(fetching)
+                            } else if resultState == "processing" || resultState == "waiting" {
+                                ProgressView(value: resultProgress)
+                                Text(resultStep.isEmpty ? "Waiting to be processed…" : resultStep).font(.footnote)
+                            } else if resultState == "failed" {
+                                Text("Studio couldn't process it: \(resultStep)").font(.footnote).foregroundStyle(.red)
+                            } else if !resultState.isEmpty {
+                                Text(resultState).font(.footnote).foregroundStyle(.secondary)
+                            }
+                        }
+                        if let imported { Label(imported, systemImage: "checkmark.circle.fill").foregroundStyle(.green) }
+                        if let importError { Text(importError).font(.footnote).foregroundStyle(.red) }
+                    } header: { Text("Processed model") } footer: {
+                        Text("When Studio finishes, bring the model back here. It replaces this scan's 3D view and exports.")
+                    }
+                }
+                Section {
+                    Button { pickingFile = true } label: { Label("Import processed model from Files…", systemImage: "square.and.arrow.down") }
+                } footer: {
+                    Text("Sent it as a zip? AirDrop or save model_textured.glb (or phone_model.glb) from Studio's results folder, then pick it here.")
+                }
                 Section {
                     if let zipURL {
                         ShareLink(item: zipURL) { Label("Share zip…", systemImage: "square.and.arrow.up") }
@@ -252,6 +307,17 @@ struct RawTransferView: View {
             .navigationTitle("Send to computer")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+        .fileImporter(isPresented: $pickingFile, allowedContentTypes: [UTType(filenameExtension: "glb") ?? .data, .data]) { result in
+            if case let .success(url) = result { importFile(url) }
+        }
+        .task {
+            // Follow Studio's progress while this screen is open.
+            while !Task.isCancelled {
+                if link == nil { link = StudioLink.load(package) }
+                if let link, resultState != "done" { await poll(link) }
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+            }
         }
         .onAppear {
             browser.start()
@@ -279,6 +345,59 @@ struct RawTransferView: View {
         let port = parts.count > 1 ? Int(parts[1]) ?? 8765 : 8765
         guard host.contains(".") || host.hasSuffix("local") else { return nil }
         return StudioComputer(name: host, host: host, port: port)
+    }
+
+    private func poll(_ link: StudioLink) async {
+        var req = URLRequest(url: URL(string: "\(link.base)/result/\(link.transfer)")!)
+        req.timeoutInterval = 4
+        req.setValue(link.code, forHTTPHeaderField: "X-Scanvas-Code")
+        guard let (data, _) = try? await URLSession.shared.data(for: req),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            resultState = "Can't reach \(link.computer) right now. Keep Scanvas Studio open on the same Wi-Fi."
+            return
+        }
+        let state = json["state"] as? String ?? ""
+        resultState = state == "unknown" ? "Studio no longer knows this scan (it was restarted). Import the model from Files instead." : state
+        resultStep = json["step"] as? String ?? ""
+        resultProgress = json["progress"] as? Double ?? 0
+    }
+
+    private func fetch() {
+        guard let link else { return }
+        fetching = true; importError = nil
+        let folder = ProjectStore.folder(for: project.id)
+        Task {
+            do {
+                var req = URLRequest(url: URL(string: "\(link.base)/result/\(link.transfer)/model.glb")!)
+                req.timeoutInterval = 300
+                req.setValue(link.code, forHTTPHeaderField: "X-Scanvas-Code")
+                let (file, response) = try await URLSession.shared.download(for: req)
+                if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                    throw StudioImport.ImportError(message: "Studio couldn't send the model (error \(http.statusCode)).")
+                }
+                let tris = try await Task.detached { try StudioImport.apply(glb: file, to: folder) }.value
+                try? FileManager.default.removeItem(at: file)
+                imported = "Imported \(tris.formatted()) triangles. Close this screen to see it."
+            } catch {
+                importError = error.localizedDescription
+            }
+            fetching = false
+        }
+    }
+
+    private func importFile(_ url: URL) {
+        importError = nil
+        let folder = ProjectStore.folder(for: project.id)
+        let access = url.startAccessingSecurityScopedResource()
+        Task {
+            do {
+                let tris = try await Task.detached { try StudioImport.apply(glb: url, to: folder) }.value
+                imported = "Imported \(tris.formatted()) triangles. Close this screen to see it."
+            } catch {
+                importError = error.localizedDescription
+            }
+            if access { url.stopAccessingSecurityScopedResource() }
+        }
     }
 
     private func makeZip() {

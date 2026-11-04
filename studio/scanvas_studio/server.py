@@ -4,6 +4,8 @@ Protocol (plain HTTP on the local network, every request carries the pairing cod
   GET  /hello                        -> {"app": "scanvas-studio", "version": 1, "name": ...}
   PUT  /upload/<transfer>/<path>     body = file bytes
   POST /done/<transfer>?name=..&files=N
+  GET  /result/<transfer>            -> {"state": "waiting|processing|done|failed", "step": .., "progress": 0-1}
+  GET  /result/<transfer>/model.glb  -> the finished textured model (Y up, as the phone expects)
 """
 from __future__ import annotations
 
@@ -63,14 +65,27 @@ _SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 class Receiver:
-    def __init__(self, on_received: Callable[[Path, str], None] | None = None, on_progress: Callable[[str], None] | None = None):
+    def __init__(self, on_received: Callable[[Path, str, str], None] | None = None, on_progress: Callable[[str], None] | None = None):
         self.home = studio_home()
+        self.results: dict[str, dict] = {}
+        self._lock = threading.Lock()
         self.code = pairing_code()
         self.on_received = on_received
         self.on_progress = on_progress
         self.httpd: ThreadingHTTPServer | None = None
         self.zeroconf = None
         self.port = PORT
+
+    def set_status(self, transfer: str | None, **values):
+        if not transfer:
+            return
+        with self._lock:
+            self.results.setdefault(transfer, {"state": "waiting", "step": "", "progress": 0.0}).update(values)
+
+    def status(self, transfer: str) -> dict | None:
+        with self._lock:
+            r = self.results.get(transfer)
+            return dict(r) if r else None
 
     def start(self):
         receiver = self
@@ -103,12 +118,30 @@ class Receiver:
                 return True
 
             def do_GET(self):
-                if self.path.startswith("/hello"):
-                    if not self._authorised():
+                if not self._authorised():
+                    return
+                parts = urllib.parse.urlparse(self.path).path.split("/")
+                if len(parts) >= 2 and parts[1] == "hello":
+                    return self._reply(200, {"app": "scanvas-studio", "version": 1, "name": socket.gethostname()})
+                if len(parts) >= 3 and parts[1] == "result" and _SAFE.match(parts[2]):
+                    st = receiver.status(parts[2])
+                    if st is None:
+                        return self._reply(404, {"state": "unknown"})
+                    if len(parts) == 3:
+                        return self._reply(200, {k: v for k, v in st.items() if k != "folder"})
+                    if len(parts) == 4 and parts[3] == "model.glb" and st.get("state") == "done":
+                        from .pipeline import phone_model
+                        path = phone_model(Path(st["folder"]))
+                        if not path or not path.exists():
+                            return self._reply(404)
+                        self.send_response(200)
+                        self.send_header("Content-Type", "model/gltf-binary")
+                        self.send_header("Content-Length", str(path.stat().st_size))
+                        self.end_headers()
+                        with open(path, "rb") as fh:
+                            shutil.copyfileobj(fh, self.wfile, 1 << 20)
                         return
-                    self._reply(200, {"app": "scanvas-studio", "version": 1, "name": socket.gethostname()})
-                else:
-                    self._reply(404)
+                self._reply(404)
 
             def do_PUT(self):
                 if not self._authorised():
@@ -154,9 +187,10 @@ class Receiver:
                     dest = dest.with_name(f"{dest.name} ({n})")
                     n += 1
                 shutil.move(str(src), str(dest))
+                receiver.set_status(parts[2], state="waiting", step="Waiting to be processed", progress=0.0)
                 self._reply(200)
                 if receiver.on_received:
-                    threading.Thread(target=receiver.on_received, args=(dest, name), daemon=True).start()
+                    threading.Thread(target=receiver.on_received, args=(dest, name, parts[2]), daemon=True).start()
 
         for port in (PORT, PORT + 1, PORT + 2, 0):
             try:
@@ -199,14 +233,38 @@ class Receiver:
 
 
 def run_forever():
-    def received(folder: Path, name: str):
+    """Receive and process scans without a window."""
+    import queue
+    from .capture import Capture
+    from .pipeline import Settings, process
+    jobs: queue.Queue = queue.Queue()
+
+    def received(folder: Path, name: str, transfer: str):
         print(f"Received {name} -> {folder}", flush=True)
+        jobs.put((folder, transfer))
 
     r = Receiver(on_received=received)
     r.start()
     print(f"Scanvas Studio is waiting for scans at {r.address} (pairing code {r.code}). Ctrl+C to stop.", flush=True)
     try:
         while True:
-            time.sleep(1)
+            try:
+                folder, transfer = jobs.get(timeout=1)
+            except queue.Empty:
+                continue
+            cap = None
+            try:
+                cap = Capture.open(folder)
+                out = folder.with_name(folder.name + " - model")
+                r.set_status(transfer, state="processing", folder=str(out))
+                process(cap, out, Settings(), lambda m, f: r.set_status(transfer, step=m, progress=f))
+                r.set_status(transfer, state="done", step="Done", progress=1.0)
+                print("Finished", out, flush=True)
+            except Exception as e:
+                r.set_status(transfer, state="failed", step=str(e))
+                print("Failed:", e, flush=True)
+            finally:
+                if cap:
+                    cap.close()
     except KeyboardInterrupt:
         r.stop()
