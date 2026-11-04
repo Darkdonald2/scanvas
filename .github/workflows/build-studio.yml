@@ -73,4 +73,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete studio --yes --cleanup-tag || true
-          gh release create studio assets/* --title "Scanvas Studio (computer app)" --notes-file studio/RELEASE_NOTES.md
+          # Create the release first, then add the large files one by one (retrying), which GitHub handles better.
+          for i in 1 2 3 4; do
+            gh release create studio --target "$GITHUB_SHA" --title "Scanvas Studio (computer app)" --notes-file studio/RELEASE_NOTES.md && break
+            sleep $((i * 10))
+          done
+          for f in assets/*; do
+            for i in 1 2 3 4; do gh release upload studio "$f" --clobber && break; sleep $((i * 10)); done
+          done
+          gh release view studio --json assets --jq '.assets[].name'
