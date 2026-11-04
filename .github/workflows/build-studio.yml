@@ -1,0 +1,78 @@
+# Builds Scanvas Studio (the computer app that processes raw iPhone scans) for macOS and Windows,
+# tests it on a synthetic scan on each system, and publishes it on the "studio" release.
+name: Build Scanvas Studio
+on:
+  push:
+    branches: [main, master]
+    paths: ["studio/**", ".github/workflows/build-studio.yml"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            asset: ScanvasStudio-mac-apple-silicon.zip
+          - os: windows-latest
+            asset: ScanvasStudio-windows.zip
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: studio
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pyinstaller
+      - name: Test on a synthetic scan
+        run: |
+          python tests/make_synthetic.py "$RUNNER_TEMP/synth" 30
+          python run_studio.py "$RUNNER_TEMP/synth" --out "$RUNNER_TEMP/out" --quality fast
+          python tests/evaluate.py "$RUNNER_TEMP/out" "$RUNNER_TEMP/synth"
+      - name: Package
+        run: |
+          pyinstaller --noconfirm --clean --name "Scanvas Studio" --windowed \
+            --collect-all open3d --collect-submodules zeroconf --hidden-import scanvas_studio.app \
+            --exclude-module dash --exclude-module plotly --exclude-module jedi --exclude-module IPython \
+            --exclude-module matplotlib --exclude-module pandas --exclude-module open3d.ml \
+            --exclude-module torch --exclude-module tensorflow \
+            run_studio.py
+      - name: Check the packaged app runs
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then APP="dist/Scanvas Studio.app/Contents/MacOS/Scanvas Studio"; else APP="dist/Scanvas Studio/Scanvas Studio.exe"; fi
+          "$APP" "$RUNNER_TEMP/synth" --out "$RUNNER_TEMP/out2" --quality fast --no-texture
+          test -f "$RUNNER_TEMP/out2/model_dense_colour.ply"
+      - name: Zip
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            ditto -c -k --keepParent "dist/Scanvas Studio.app" "${{ matrix.asset }}"
+          else
+            powershell -Command "Compress-Archive -Path 'dist/Scanvas Studio' -DestinationPath '${{ matrix.asset }}'"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: studio/${{ matrix.asset }}
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Source zip
+        run: cd studio && zip -qr ../assets/ScanvasStudio-source.zip . -x "tests/*"
+      - name: Publish to the "studio" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete studio --yes --cleanup-tag || true
+          gh release create studio assets/* --title "Scanvas Studio (computer app)" --notes-file studio/RELEASE_NOTES.md

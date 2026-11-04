@@ -4,6 +4,7 @@ name: Build IPA
 on:
   push:
     branches: [main, master]
+    paths-ignore: ["studio/**", ".github/workflows/build-studio.yml"]
   workflow_dispatch:
 permissions:
   contents: write
