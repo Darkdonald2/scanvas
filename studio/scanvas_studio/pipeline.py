@@ -3,7 +3,8 @@
 Steps (each reports progress):
   1. Choose photos: drop blurred ones, keep the sharpest in every spot.
   2. Fuse depth: every LiDAR depth map goes into one volume (TSDF), far more detail than the phone's live mesh.
-  3. Refine cameras: line each photo's depth up with the fused surface (ICP), then fuse again.
+  3. Refine cameras: line each photo's depth up with the phone's own mesh (which has ARKit's corrections in it),
+     then with the fused surface (ICP), then fuse again.
   4. Clean: remove floating bits and smooth noise.
   5. Texture: unwrap the mesh and project the best full-resolution photos onto it.
   6. Export: OBJ (textured), GLB, PLY (coloured), point cloud.
@@ -175,6 +176,100 @@ def fuse(frames: list[Frame], s: Settings, report: Report, base: float, span: fl
     report(f"{label}: building the surface", base + span)
     mesh = vbg.extract_triangle_mesh(weight_threshold=1.5)
     return mesh.to_legacy()
+
+
+# ---------------------------------------------------------------------------------------------- camera alignment
+
+def _depth_cloud(f: Frame, max_depth: float, target_points: int = 4000):
+    """A frame's reliable LiDAR depth as world points (at the frame's current position)."""
+    o3d = _o3d()
+    d = f.load_depth(2, max_depth, drop_edges=True)
+    if np.count_nonzero(d) < 1500:
+        d = f.load_depth(1, max_depth, drop_edges=True)
+    v, u = np.nonzero(d)
+    if len(u) < 500:
+        return None
+    sel = np.arange(0, len(u), max(1, len(u) // target_points))
+    u, v = u[sel], v[sel]
+    z = d[v, u]
+    k = f.depth_intrinsic()
+    pts = np.stack([(u - k[0, 2]) / k[0, 0] * z, (v - k[1, 2]) / k[1, 1] * z, z], axis=1)
+    c2w = np.linalg.inv(f.extrinsic())
+    return o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts @ c2w[:3, :3].T + c2w[:3, 3]))
+
+
+def align_to_phone_mesh(folder: Path, frames: list[Frame], s: Settings, report: Report, base: float, span: float):
+    """Moves each photo to where it fits the phone's own finished mesh, and drops photos that fit nowhere.
+
+    While scanning, ARKit keeps correcting its map, and its mesh is rebuilt to match. The photos keep the
+    position they had when they were taken, so early ones can be tens of centimetres off, which fuses every
+    wall two or three times. The phone's mesh (arkit_mesh.ply) is coarse but in the corrected map, so it is the
+    reference: each photo's depth is slid onto it (point-to-plane ICP, coarse to fine). The fine alignment
+    against Studio's own fused surface comes afterwards.
+    Returns the photos to use and a few numbers for the log."""
+    o3d = _o3d()
+    reg = o3d.pipelines.registration
+    path = Path(folder) / "arkit_mesh.ply"
+    if not path.exists():
+        return frames, {}
+    mesh = o3d.io.read_triangle_mesh(str(path))
+    if len(mesh.triangles) < 500:
+        return frames, {}
+    n = int(min(1_500_000, max(100_000, mesh.get_surface_area() * 5000)))
+    target = mesh.sample_points_uniformly(number_of_points=n, use_triangle_normal=True).voxel_down_sample(0.02)
+    target.normalize_normals()
+    check = 0.04                                   # a point "fits" when it is within 4 cm of the phone's mesh
+
+    def icp(src, init, ladder):
+        T = init
+        for dist in ladder:
+            r = reg.registration_icp(src, target, dist, T, reg.TransformationEstimationPointToPlane(reg.TukeyLoss(k=dist)),
+                                     reg.ICPConvergenceCriteria(max_iteration=30))
+            T = r.transformation
+        return T, reg.evaluate_registration(src, target, check, T)
+
+    original = [f.camera_to_world.copy() for f in frames]
+    previous = np.eye(4)
+    keep, shifts = [], []
+    moved = dropped = 0
+    for i, f in enumerate(frames):
+        if i % 10 == 0:
+            report(f"Lining photos up with the phone's map ({i + 1} of {len(frames)})", base + span * i / max(1, len(frames)))
+        src = _depth_cloud(f, min(s.max_depth, 4.0))
+        if src is None:
+            keep.append(f)
+            continue
+        e0 = reg.evaluate_registration(src, target, check, np.eye(4))
+        if e0.fitness >= 0.85:
+            tries = [icp(src, np.eye(4), (0.06, 0.03))]
+        else:
+            tries = [icp(src, np.eye(4), (0.5, 0.25, 0.12, 0.06, 0.03))]
+            if not np.allclose(previous, np.eye(4)):
+                # Drift changes slowly, so the correction the photo before needed is a good place to start.
+                tries.append(icp(src, previous, (0.12, 0.06, 0.03)))
+        T, e1 = max(tries, key=lambda t: (round(t[1].fitness, 2), -t[1].inlier_rmse))
+        shift = float(np.linalg.norm(T[:3, 3] + (T[:3, :3] - np.eye(3)) @ f.position()))     # how far the camera moves
+        angle = math.degrees(math.acos(max(-1.0, min(1.0, (np.trace(T[:3, :3]) - 1) / 2))))
+        better = e1.fitness >= e0.fitness + 0.02 or (e1.fitness >= e0.fitness and e1.inlier_rmse < e0.inlier_rmse * 0.92)
+        if e1.fitness >= 0.45 and better and shift < 1.5 and angle < 20:
+            f.camera_to_world = T @ f.camera_to_world
+            previous = T
+            moved += 1
+            shifts.append(shift)
+            keep.append(f)
+        elif max(e0.fitness, e1.fitness) < 0.25:
+            dropped += 1                           # fits the map nowhere nearby: it would only add a ghost surface
+        else:
+            keep.append(f)
+    if dropped > 0.35 * len(frames):
+        # The phone's mesh doesn't match this capture well enough to judge by; leave everything as it was.
+        for f, m in zip(frames, original):
+            f.camera_to_world = m
+        return frames, {"alignment_skipped": "the phone's mesh did not match the photos"}
+    stats = {"frames_aligned": moved, "frames_dropped": dropped}
+    if shifts:
+        stats["alignment_shift_cm"] = {"median": round(float(np.median(shifts)) * 100, 1), "largest": round(float(np.max(shifts)) * 100, 1)}
+    return keep, stats
 
 
 # ---------------------------------------------------------------------------------------------- camera refinement
@@ -402,8 +497,11 @@ def process(capture: Capture, out: Path, s: Settings, report: Report) -> dict:
     frames = choose_frames(capture.frames, s.fuse_frames, report, 0.0, 0.08)
     log["frames_used"] = len(frames)
     if s.refine_cameras:
+        frames, aligned = align_to_phone_mesh(capture.folder, frames, s, report, 0.08, 0.07)
+        log.update(aligned)
+        log["frames_used"] = len(frames)
         mesh = fuse(frames, s if s.quality == "fast" else Settings(**{**asdict(s), "quality": "fast"}),
-                    report, 0.08, 0.17, "Fusing depth, first pass")
+                    report, 0.15, 0.10, "Fusing depth, first pass")
         mesh.compute_vertex_normals()
         log["cameras_refined"] = refine_cameras(frames, mesh, s, report, 0.25, 0.15)
         del mesh

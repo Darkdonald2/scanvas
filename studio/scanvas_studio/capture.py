@@ -33,6 +33,7 @@ class Frame:
     camera_to_world: np.ndarray            # 4x4, ARKit convention, drift-corrected once loaded
     exposure: float = 0.0
     anchors: dict = field(default_factory=dict)
+    pose_anchors: dict = field(default_factory=dict)      # anchors the app dropped along the path (newer captures)
     sharpness: float = 0.0
 
     def intrinsic(self, scale: float = 1.0) -> np.ndarray:
@@ -114,6 +115,11 @@ class Capture:
                 pass
         anchors_path = folder / "anchors.json"
         self.final_anchors = {k: _matrix(v) for k, v in json.loads(anchors_path.read_text()).items()} if anchors_path.exists() else {}
+        pose_path = folder / "pose_anchors.json"
+        try:
+            self.final_pose_anchors = {k: _matrix(v) for k, v in json.loads(pose_path.read_text()).items()} if pose_path.exists() else {}
+        except (ValueError, OSError):
+            self.final_pose_anchors = {}
         self.frames: list[Frame] = []
         with open(folder / "frames.jsonl") as fh:
             for line in fh:
@@ -130,7 +136,8 @@ class Capture:
                           width=j["width"], height=j["height"], depth_width=j["depthWidth"], depth_height=j["depthHeight"],
                           fx=fx, fy=fy, cx=cx, cy=cy, camera_to_world=_matrix(j["cameraToWorld"]),
                           exposure=j.get("exposureDuration", 0.0),
-                          anchors={k: _matrix(v) for k, v in j.get("anchors", {}).items()})
+                          anchors={k: _matrix(v) for k, v in j.get("anchors", {}).items()},
+                          pose_anchors={k: _matrix(v) for k, v in j.get("poseAnchors", {}).items()})
                 if f.image.exists() and f.depth.exists():
                     self.frames.append(f)
         self.frames.sort(key=lambda f: f.timestamp)
@@ -171,9 +178,20 @@ class Capture:
     def _correct_drift(self):
         """ARKit keeps moving mesh anchors as it learns the space. Each frame stored the anchors near what it looked
         at; move its camera by how much the nearest of those has moved since (as the phone does)."""
-        if not self.final_anchors:
-            return
         for f in self.frames:
+            # Newer captures drop an anchor on the camera's path every second or so. ARKit moves those when it
+            # corrects its map, so the nearest one says directly how far this photo's position has shifted.
+            best, best_d = None, 1e9
+            for key, then in f.pose_anchors.items():
+                if key in self.final_pose_anchors:
+                    d = np.linalg.norm(then[:3, 3] - f.position())
+                    if d < best_d:
+                        best, best_d = key, d
+            if best is not None:
+                f.camera_to_world = self.final_pose_anchors[best] @ np.linalg.inv(f.pose_anchors[best]) @ f.camera_to_world
+                continue
+            if not self.final_anchors:
+                continue
             target = f.position() + f.forward() * 1.5
             best, best_d = None, 1e9
             for key in f.anchors:

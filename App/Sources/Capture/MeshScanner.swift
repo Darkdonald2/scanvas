@@ -72,6 +72,11 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
     /// (screenshot, notification, app switcher), when ARKit can drop anchors from the session.
     private var meshAnchors: [UUID: ARMeshAnchor] = [:]
     private let anchorLock = NSLock()
+    /// Anchors dropped on the camera's path during raw capture. ARKit moves them when it corrects its map, so
+    /// the computer can work out afterwards how far each early photo's position has shifted.
+    private var poseAnchors: [UUID: simd_float4x4] = [:]
+    private var lastPoseAnchor: (transform: simd_float4x4, time: TimeInterval)?
+    static let poseAnchorName = "scanvas-pose"
     private var sharpnessMean: Float = 0
     private var motionPose: simd_float4x4?
     private var motionTime: TimeInterval = 0
@@ -115,6 +120,9 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
             config.videoFormat = format
         }
         arView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+        anchorLock.lock(); poseAnchors = [:]; anchorLock.unlock()
+        lastPoseAnchor = nil
+        normalSince = nil
         startTime = Date()
         isScanning = true
     }
@@ -150,6 +158,7 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
         guard isScanning else { return }
         anchorLock.lock()
         for case let a as ARMeshAnchor in anchors { meshAnchors[a.identifier] = a }
+        for a in anchors where a.name == Self.poseAnchorName { poseAnchors[a.identifier] = a.transform }
         anchorLock.unlock()
         guard detectPlanes else { return }
         var floor = floorEstimate, ceiling = ceilingEstimate
@@ -189,16 +198,21 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
         let now = frame.timestamp
         frameHandler?(frame)
         trackSpeed(frame.camera.transform, now)
-        if isScanning, let raw {
-            raw.consider(frame) { nearbyAnchors(frame.camera.transform) }
+        // How long tracking has been steady. Photos taken while ARKit is still finding its feet (the first second
+        // or two, and just after it loses and regains its place) are in the wrong spot, so nothing is recorded then.
+        if case .normal = frame.camera.trackingState {
+            if normalSince == nil { normalSince = now }
+        } else {
+            normalSince = nil
         }
-        if lockExposure && !exposureLocked && isScanning {
-            if case .normal = frame.camera.trackingState {
-                if normalSince == nil { normalSince = now }
-                if now - (normalSince ?? now) > 1.5 { setExposureLock(true) }
-            } else {
-                normalSince = nil
-            }
+        let steady = normalSince.map { now - $0 } ?? 0
+        if lockExposure && !exposureLocked && isScanning && steady > 1.5 { setExposureLock(true) }
+        // Raw photos start half a second after the exposure lock, so every one has the same brightness.
+        if isScanning, let raw, steady > 2.0 {
+            dropPoseAnchor(frame, now)
+            raw.consider(frame, turning: angularSpeed, walking: linearSpeed,
+                         anchors: { nearbyAnchors(frame.camera.transform) },
+                         poseAnchors: { nearbyPoseAnchors(frame.camera.transform) })
         }
         if now - lastStatsTime > 0.5 {
             lastStatsTime = now
@@ -273,6 +287,41 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
         }.prefix(8)
         anchorLock.unlock()
         return Dictionary(uniqueKeysWithValues: near.map { ($0.identifier, $0.transform) })
+    }
+
+    /// Leaves an anchor where the camera is now, whenever it has moved on from the last one.
+    private func dropPoseAnchor(_ frame: ARFrame, _ now: TimeInterval) {
+        let t = frame.camera.transform
+        if let last = lastPoseAnchor {
+            let moved = simd_distance(SIMD3(t.columns.3.x, t.columns.3.y, t.columns.3.z),
+                                      SIMD3(last.transform.columns.3.x, last.transform.columns.3.y, last.transform.columns.3.z))
+            let turned = acos(min(1, max(-1, simd_dot(SIMD3(t.columns.2.x, t.columns.2.y, t.columns.2.z),
+                                                       SIMD3(last.transform.columns.2.x, last.transform.columns.2.y, last.transform.columns.2.z)))))
+            let since = now - last.time
+            guard since > 3 || (since > 0.7 && (moved > 0.5 || turned > 0.6)) else { return }
+        }
+        let anchor = ARAnchor(name: Self.poseAnchorName, transform: t)
+        arView.session.add(anchor: anchor)
+        anchorLock.lock(); poseAnchors[anchor.identifier] = t; anchorLock.unlock()
+        lastPoseAnchor = (t, now)
+    }
+
+    /// The three path anchors nearest the camera, as they are placed right now.
+    func nearbyPoseAnchors(_ t: simd_float4x4) -> [UUID: simd_float4x4] {
+        let here = SIMD3(t.columns.3.x, t.columns.3.y, t.columns.3.z)
+        anchorLock.lock()
+        let near = poseAnchors.sorted {
+            simd_distance_squared(SIMD3($0.value.columns.3.x, $0.value.columns.3.y, $0.value.columns.3.z), here)
+                < simd_distance_squared(SIMD3($1.value.columns.3.x, $1.value.columns.3.y, $1.value.columns.3.z), here)
+        }.prefix(3)
+        anchorLock.unlock()
+        return Dictionary(uniqueKeysWithValues: near.map { ($0.key, $0.value) })
+    }
+
+    /// Every path anchor's current pose.
+    func poseAnchorTransforms() -> [UUID: simd_float4x4] {
+        anchorLock.lock(); defer { anchorLock.unlock() }
+        return poseAnchors
     }
 
     /// Every mesh anchor's current pose.

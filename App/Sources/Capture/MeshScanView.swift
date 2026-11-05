@@ -129,7 +129,7 @@ struct MeshScanView: View {
             }
             if let raw = scanner.raw {
                 report("Saving raw capture…", 0.005)
-                raw.finish(anchors: scanner.anchorTransforms(), mesh: collected, kind: "space")
+                raw.finish(anchors: scanner.anchorTransforms(), poseAnchors: scanner.poseAnchorTransforms(), mesh: collected, kind: "space")
             }
             do {
                 let (mesh, thumbScene) = try SpaceProcessing.process(collected, scanner: scanner, folder: folder,

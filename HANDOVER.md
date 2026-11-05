@@ -183,6 +183,18 @@ to `main` trigger the builds. Studio-only changes don't rebuild the ipa.
 
 ## 8. Recent fixes (newest first)
 
+- **Doubled walls from camera drift** (5 November 2026, second change). ARKit corrects its map during a scan
+  but photos keep the position they were taken at, so early photos can be tens of centimetres off. Studio's
+  old refinement only accepted corrections under 8 cm against a first pass that was itself doubled.
+  `pipeline.align_to_phone_mesh` now slides every photo's depth onto `arkit_mesh.ply` first (coarse-to-fine
+  ICP from 50 cm, starting from the previous photo's correction) and drops photos that fit nowhere. CI builds
+  a synthetic scan whose first photos are 40 cm and 8° out and fails if the result isn't clean.
+- **Raw capture changes** (same change): the app drops an `ARAnchor` on the camera's path about once a second
+  and saves the nearest three per frame (`poseAnchors`) plus their final poses (`pose_anchors.json`); Studio
+  prefers these over mesh anchors for drift correction. Raw photos now start only after tracking has been
+  steady for 2 s (after the exposure lock at 1.5 s) and pause the same way after tracking is lost, photos
+  taken while turning faster than about 70°/s are skipped, and each frame records mapping state and speeds.
+  None of the capture changes has been tried on a phone yet.
 - **The phone couldn't import Studio's GLB** (5 November 2026). `write_glb` built the `bufferViews` table but
   never put it in the file, so no program could read Studio's GLBs and the phone refused them. Fixed in Studio;
   CI now reads the GLB back (`studio/tests/check_glb.py`). The phone's `StudioImport` also rebuilds the table

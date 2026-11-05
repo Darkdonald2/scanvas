@@ -9,11 +9,13 @@ import simd
 ///
 /// Folder layout (format "scanvas-raw", version 1):
 ///   capture.json            what was captured and how
-///   frames.jsonl            one JSON object per frame (pose, intrinsics, exposure, nearby anchor poses)
+///   frames.jsonl            one JSON object per frame (pose, intrinsics, exposure, nearby anchor poses,
+///                           the path anchors near the camera, mapping state and how fast the phone was moving)
 ///   images/000000.jpg       camera photo, full camera resolution
 ///   depth/000000.bin        LiDAR depth, Float32 metres, depthWidth × depthHeight, row-major
 ///   confidence/000000.bin   LiDAR confidence, UInt8 0 low / 1 medium / 2 high
 ///   anchors.json            final pose of every mesh anchor (to undo tracking drift on old frames)
+///   pose_anchors.json       final pose of every path anchor (dropped on the camera's path about once a second)
 ///   arkit_mesh.ply          the phone's own LiDAR mesh, for reference
 final class RawRecorder {
     static var enabled: Bool { UserDefaults.standard.object(forKey: "rawCapture") as? Bool ?? false }
@@ -23,6 +25,7 @@ final class RawRecorder {
     let folder: URL
     private(set) var frameCount = 0
     private(set) var skipped = 0
+    private(set) var blurred = 0
     private(set) var bytes: Int64 = 0
     private var imageSize = CGSize.zero
     private var depthSize = (0, 0)
@@ -51,9 +54,13 @@ final class RawRecorder {
 
     /// Called for every camera frame. Keeps a frame whenever the phone has moved or turned a little,
     /// up to about 6 a second (4 a second at 4K), and at least once a second while standing still.
-    func consider(_ frame: ARFrame, anchors: () -> [UUID: simd_float4x4]) {
+    /// `turning` (radians a second) and `walking` (metres a second) are the phone's smoothed speeds.
+    func consider(_ frame: ARFrame, turning: Float = 0, walking: Float = 0,
+                  anchors: () -> [UUID: simd_float4x4], poseAnchors: () -> [UUID: simd_float4x4] = { [:] }) {
         let now = frame.timestamp
         guard now - lastTime >= interval, case .normal = frame.camera.trackingState else { return }
+        // Photos taken while swinging the phone round are smeared; wait for it to slow, but never for long.
+        if (turning > 1.2 || walking > 0.9) && now - lastTime < 0.7 { blurred += 1; return }
         let t = frame.camera.transform
         if let last = lastPose, now - lastTime < 1.0 {
             let moved = simd_distance(SIMD3(t.columns.3.x, t.columns.3.y, t.columns.3.z), SIMD3(last.columns.3.x, last.columns.3.y, last.columns.3.z))
@@ -88,6 +95,17 @@ final class RawRecorder {
         if let light {
             line += ",\"ambientIntensity\":\(light.ambientIntensity),\"colorTemperature\":\(light.ambientColorTemperature)"
         }
+        let mapping: String
+        switch frame.worldMappingStatus {
+        case .mapped: mapping = "mapped"
+        case .extending: mapping = "extending"
+        case .limited: mapping = "limited"
+        default: mapping = "notAvailable"
+        }
+        line += ",\"tracking\":\"normal\",\"mapping\":\"\(mapping)\""
+        line += ",\"turnSpeed\":\(String(format: "%.3f", turning)),\"walkSpeed\":\(String(format: "%.3f", walking))"
+        let path = poseAnchors()
+        line += ",\"poseAnchors\":{" + path.map { "\"\($0.key.uuidString)\":\(Self.json($0.value))" }.joined(separator: ",") + "}"
         let near = anchors()
         line += ",\"anchors\":{" + near.map { "\"\($0.key.uuidString)\":\(Self.json($0.value))" }.joined(separator: ",") + "}}\n"
 
@@ -109,12 +127,14 @@ final class RawRecorder {
     }
 
     /// Waits for every frame to be written and adds the summary files.
-    func finish(anchors: [UUID: simd_float4x4], mesh: MeshData, kind: String) {
+    func finish(anchors: [UUID: simd_float4x4], poseAnchors: [UUID: simd_float4x4] = [:], mesh: MeshData, kind: String) {
         queue.sync {}
         try? log?.close()
         log = nil
         let anchorJSON = "{" + anchors.map { "\"\($0.key.uuidString)\":\(Self.json($0.value))" }.joined(separator: ",") + "}"
         try? anchorJSON.write(to: folder.appendingPathComponent("anchors.json"), atomically: true, encoding: .utf8)
+        let pathJSON = "{" + poseAnchors.map { "\"\($0.key.uuidString)\":\(Self.json($0.value))" }.joined(separator: ",") + "}"
+        try? pathJSON.write(to: folder.appendingPathComponent("pose_anchors.json"), atomically: true, encoding: .utf8)
         try? Self.writePLY(mesh, to: folder.appendingPathComponent("arkit_mesh.ply"))
         let iso = ISO8601DateFormatter().string(from: started)
         var system = utsname()
@@ -122,7 +142,7 @@ final class RawRecorder {
         let model = withUnsafeBytes(of: &system.machine) { raw in String(decoding: raw.prefix(while: { byte in byte != 0 }), as: UTF8.self) }
         let info = """
         {"format":"scanvas-raw","version":1,"app":"Scanvas","kind":"\(kind)","created":"\(iso)","device":"\(model)",
-        "frames":\(frameCount),"skippedFrames":\(skipped),"imageWidth":\(Int(imageSize.width)),"imageHeight":\(Int(imageSize.height)),
+        "frames":\(frameCount),"skippedFrames":\(skipped),"blurredFramesSkipped":\(blurred),"imageWidth":\(Int(imageSize.width)),"imageHeight":\(Int(imageSize.height)),
         "depthWidth":\(depthSize.0),"depthHeight":\(depthSize.1),"depthUnits":"metres","depthFormat":"float32","confidenceFormat":"uint8 0-2",
         "coordinates":"ARKit world: right-handed, metres, Y up (gravity). Camera looks along -Z with +Y up; image pixels start top-left.",
         "intrinsics":"fx, fy, cx, cy in image pixels","poses":"cameraToWorld, 4x4 column-major",
