@@ -47,7 +47,7 @@ class Settings:
 
     @property
     def texture_photos(self) -> int:
-        return {"fast": 80, "high": 200, "ultra": 320}[self.quality]
+        return {"fast": 150, "high": 500, "ultra": 800}[self.quality]
 
     @property
     def texture_size(self) -> int:
@@ -157,7 +157,7 @@ def fuse(frames: list[Frame], s: Settings, report: Report, base: float, span: fl
     for i, f in enumerate(frames):
         if i % 10 == 0:
             report(f"{label} ({i + 1} of {len(frames)})", base + span * i / max(1, len(frames)))
-        d = f.load_depth(s.min_confidence, s.max_depth)
+        d = f.load_depth(s.min_confidence, s.max_depth, drop_edges=True)
         if not np.any(d):
             continue
         # Colour at half resolution is plenty for the volume; the texture uses full-resolution photos.
@@ -190,7 +190,7 @@ def refine_cameras(frames: list[Frame], mesh, s: Settings, report: Report, base:
     for i, f in enumerate(frames):
         if i % 10 == 0:
             report(f"Refining cameras ({i + 1} of {len(frames)})", base + span * i / max(1, len(frames)))
-        d = f.load_depth(2, min(s.max_depth, 4.0))
+        d = f.load_depth(2, min(s.max_depth, 4.0), drop_edges=True)
         v, u = np.nonzero(d)
         if len(u) < 500:
             continue
@@ -291,10 +291,29 @@ def texture(mesh, frames: list[Frame], s: Settings, report: Report, base: float,
     F = t.triangle.indices.numpy().astype(np.int64)
     UV = t.triangle.texture_uvs.numpy().astype(np.float64)
     colours = t.vertex.colors.numpy().astype(np.float32) if "colors" in t.vertex else None
+    if colours is None or len(colours) != len(V):
+        colours = _nearest_colours(mesh, V)
     normals = np.asarray(work.vertex_normals) if len(work.vertex_normals) == len(V) else np.zeros_like(V)
     photos = spread_frames(frames, s.texture_photos)
     image, stats = bake(V, F, UV, colours, photos, s.texture_size, report, base + span * 0.1, span * 0.9)
     return {"V": V, "F": F, "UV": UV, "normals": normals, "image": image, "stats": stats}
+
+
+def _nearest_colours(mesh, V: np.ndarray):
+    """Fused colours for the simplified mesh's vertices, taken from the nearest vertex of the full mesh
+    (simplifying can drop them). Used for the few surfaces no photo shows."""
+    o3d = _o3d()
+    src = np.asarray(mesh.vertex_colors)
+    if len(src) != len(mesh.vertices) or not len(src):
+        return None
+    try:
+        import open3d.core as o3c
+        nns = o3c.nns.NearestNeighborSearch(o3c.Tensor(np.asarray(mesh.vertices, dtype=np.float32)))
+        nns.knn_index()
+        idx, _ = nns.knn_search(o3c.Tensor(V.astype(np.float32)), 1)
+        return src[idx.numpy().ravel()].astype(np.float32)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------------------------- export

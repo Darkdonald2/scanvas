@@ -69,6 +69,8 @@ class Receiver:
         self.home = studio_home()
         self.results: dict[str, dict] = {}
         self._lock = threading.Lock()
+        self._saved = self.home / "transfers.json"
+        self._load_results()
         self.code = pairing_code()
         self.on_received = on_received
         self.on_progress = on_progress
@@ -76,11 +78,42 @@ class Receiver:
         self.zeroconf = None
         self.port = PORT
 
+    def _load_results(self):
+        """Scans sent before Studio was last closed: the phone can still fetch the finished ones."""
+        try:
+            saved = json.loads(self._saved.read_text())
+        except (OSError, ValueError):
+            return
+        if not isinstance(saved, dict):
+            return
+        for transfer, r in saved.items():
+            if not isinstance(r, dict) or not _SAFE.match(str(transfer)):
+                continue
+            if r.get("state") in ("waiting", "processing"):
+                r = {**r, "state": "failed", "step": "Scanvas Studio was closed before it finished. Open the scan's folder in Studio to process it again."}
+            self.results[transfer] = r
+
     def set_status(self, transfer: str | None, **values):
         if not transfer:
             return
         with self._lock:
-            self.results.setdefault(transfer, {"state": "waiting", "step": "", "progress": 0.0}).update(values)
+            r = self.results.setdefault(transfer, {"state": "waiting", "step": "", "progress": 0.0})
+            before = (r.get("state"), r.get("folder"))
+            r.update(values)
+            if (r.get("state"), r.get("folder")) != before:      # not on every progress tick
+                try:
+                    keep = dict(list(self.results.items())[-50:])
+                    self._saved.write_text(json.dumps(keep))
+                except OSError:
+                    pass
+
+    def transfer_for(self, source: Path) -> str:
+        """The transfer a raw scan folder arrived as, so processing it again by hand still reaches the phone."""
+        with self._lock:
+            for transfer, r in reversed(list(self.results.items())):
+                if r.get("source") and Path(r["source"]) == Path(source):
+                    return transfer
+        return ""
 
     def status(self, transfer: str) -> dict | None:
         with self._lock:
@@ -128,7 +161,7 @@ class Receiver:
                     if st is None:
                         return self._reply(404, {"state": "unknown"})
                     if len(parts) == 3:
-                        return self._reply(200, {k: v for k, v in st.items() if k != "folder"})
+                        return self._reply(200, {k: v for k, v in st.items() if k not in ("folder", "source")})
                     if len(parts) == 4 and parts[3] == "model.glb" and st.get("state") == "done":
                         from .pipeline import phone_model
                         path = phone_model(Path(st["folder"]))
@@ -187,7 +220,7 @@ class Receiver:
                     dest = dest.with_name(f"{dest.name} ({n})")
                     n += 1
                 shutil.move(str(src), str(dest))
-                receiver.set_status(parts[2], state="waiting", step="Waiting to be processed", progress=0.0)
+                receiver.set_status(parts[2], state="waiting", step="Waiting to be processed", progress=0.0, source=str(dest))
                 self._reply(200)
                 if receiver.on_received:
                     threading.Thread(target=receiver.on_received, args=(dest, name, parts[2]), daemon=True).start()

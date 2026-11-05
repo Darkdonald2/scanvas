@@ -54,14 +54,40 @@ class Frame:
     def forward(self) -> np.ndarray:
         return -self.camera_to_world[:3, 2]
 
-    def load_depth(self, min_confidence: int = 1, max_depth: float = 5.0) -> np.ndarray:
+    def load_depth(self, min_confidence: int = 1, max_depth: float = 5.0, drop_edges: bool = False) -> np.ndarray:
+        """Depth in metres, 0 where unusable. `drop_edges` also removes the pixels along the outline of things:
+        there the sensor blends the near and the far surface into depths that belong to neither, which would
+        otherwise become thin sheets of surface hanging off the edges of furniture and people."""
         d = np.fromfile(self.depth, dtype=np.float32).reshape(self.depth_height, self.depth_width).copy()
         if self.confidence is not None and self.confidence.exists():
             c = np.fromfile(self.confidence, dtype=np.uint8).reshape(self.depth_height, self.depth_width)
             d[c < min_confidence] = 0
         d[~np.isfinite(d)] = 0
         d[(d < 0.2) | (d > max_depth)] = 0
+        if drop_edges:
+            d[depth_edges(d)] = 0
         return d
+
+
+def depth_edges(d: np.ndarray) -> np.ndarray:
+    """True where depth jumps. A flat surface, however steeply it is seen, changes depth evenly from pixel to
+    pixel, so the test is how far a pixel is from the middle of its two neighbours (across and down)."""
+    limit = 0.015 + 0.02 * d
+    bend = np.zeros(d.shape, np.float32)
+    h = np.abs(d[:, :-2] + d[:, 2:] - 2 * d[:, 1:-1])
+    h[(d[:, :-2] == 0) | (d[:, 2:] == 0)] = 0
+    v = np.abs(d[:-2] + d[2:] - 2 * d[1:-1])
+    v[(d[:-2] == 0) | (d[2:] == 0)] = 0
+    bend[:, 1:-1] = h
+    bend[1:-1] = np.maximum(bend[1:-1], v)
+    edge = (bend > limit) & (d > 0)
+    # One pixel either side as well: the blended depths spread a little beyond the jump itself.
+    grown = edge.copy()
+    grown[:, 1:] |= edge[:, :-1]
+    grown[:, :-1] |= edge[:, 1:]
+    grown[1:] |= edge[:-1]
+    grown[:-1] |= edge[1:]
+    return grown
 
 
 def _matrix(values) -> np.ndarray:
