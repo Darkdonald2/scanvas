@@ -1,5 +1,6 @@
 import SceneKit
 import UIKit
+import ImageIO
 import simd
 
 enum SceneExport {
@@ -62,6 +63,7 @@ enum SceneExport {
         let scene = SCNScene()
         var cull: SCNCullMode = .back
         if let first = t.pages.first(where: { !$0.indices.isEmpty }) { cull = facesTowardNormals(first.asMesh) ? .back : .front }
+        let live = t.pages.filter { !$0.indices.isEmpty }.count
         for (i, page) in t.pages.enumerated() where !page.indices.isEmpty {
             var sources = [SCNGeometrySource(vertices: page.positions.map { SCNVector3($0.x, $0.y, $0.z) })]
             if page.normals.count == page.positions.count {
@@ -70,7 +72,14 @@ enum SceneExport {
             sources.append(SCNGeometrySource(textureCoordinates: page.uvs.map { CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)) }))
             let g = SCNGeometry(sources: sources, elements: [SCNGeometryElement(indices: page.indices, primitiveType: .triangles)])
             let mat = SCNMaterial()
-            mat.diffuse.contents = folder.appendingPathComponent(TexturedMesh.textureName(i))
+            let texture = folder.appendingPathComponent(TexturedMesh.textureName(i))
+            // Many full-size pages together need more graphics memory than a phone has, so the viewer shows
+            // them smaller. Exports (dollhouse off) always use the full-size pictures.
+            if dollhouse, live > 3, let small = smaller(texture, maxPixel: live > 6 ? 2048 : 3072) {
+                mat.diffuse.contents = small
+            } else {
+                mat.diffuse.contents = texture
+            }
             mat.diffuse.mipFilter = .linear
             mat.diffuse.maxAnisotropy = 16
             // The photos already contain the room's real lighting.
@@ -88,6 +97,15 @@ enum SceneExport {
             scene.rootNode.addChildNode(node)
         }
         return scene
+    }
+
+    /// The picture at `url`, scaled down so its longer side is at most `maxPixel` (nil when it can't be read).
+    private static func smaller(_ url: URL, maxPixel: Int) -> CGImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                        kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+                                        kCGImageSourceShouldCacheImmediately: true]
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }
 
     /// A room with one node per wall, so the viewer can hide the walls between the camera and the room.

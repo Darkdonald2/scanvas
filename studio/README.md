@@ -11,7 +11,8 @@ model far denser and sharper than a phone can process on its own.
 3. **Refines cameras**: lines each photo's depth up with the fused surface (point-to-plane ICP), then fuses again.
 4. **Cleans**: removes floating bits and smooths LiDAR noise.
 5. **Textures**: unwraps the surface and paints every texel from the single best full-resolution photo of that
-   spot (close, head-on, sharp, and not hidden behind anything), with patches joined and brightness matched.
+   spot (close, head-on, sharp, not hidden behind anything, and agreeing with that photo's own LiDAR depth, so
+   people who walked through aren't painted onto the walls), with patches joined and colours levelled.
 6. **Exports** to the results folder:
    - `model_textured.obj` with `.mtl` and `.jpg`, for Revit, SketchUp, Blender, 3ds Max and Rhino
    - `model_textured.glb`, for web viewers, Blender, Unity and Unreal

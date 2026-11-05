@@ -215,6 +215,7 @@ struct RawTransferView: View {
     @State private var imported: String?
     @State private var importError: String?
     @State private var pickingFile = false
+    @State private var importing = false
 
     private var package: RawPackage { RawPackage(project: project) }
 
@@ -256,7 +257,7 @@ struct RawTransferView: View {
                 } header: { Text("Send over Wi-Fi") } footer: {
                     Text("Open Scanvas Studio on the computer, keep this phone unlocked, and stay on the same Wi-Fi.")
                 }
-                if link != nil || imported != nil {
+                if link != nil {
                     Section {
                         if let link {
                             LabeledContent("Sent to", value: link.computer)
@@ -274,16 +275,19 @@ struct RawTransferView: View {
                                 Text(resultState).font(.footnote).foregroundStyle(.secondary)
                             }
                         }
-                        if let imported { Label(imported, systemImage: "checkmark.circle.fill").foregroundStyle(.green) }
-                        if let importError { Text(importError).font(.footnote).foregroundStyle(.red) }
                     } header: { Text("Processed model") } footer: {
                         Text("When Studio finishes, bring the model back here. It replaces this scan's 3D view and exports.")
                     }
                 }
                 Section {
-                    Button { pickingFile = true } label: { Label("Import processed model from Files…", systemImage: "square.and.arrow.down") }
+                    Button { pickingFile = true } label: {
+                        if importing { HStack { ProgressView(); Text("Importing…") } } else { Label("Import processed model from Files…", systemImage: "square.and.arrow.down") }
+                    }
+                    .disabled(importing || fetching)
+                    if let imported { Label(imported, systemImage: "checkmark.circle.fill").foregroundStyle(.green) }
+                    if let importError { Label(importError, systemImage: "exclamationmark.triangle.fill").font(.footnote).foregroundStyle(.red) }
                 } footer: {
-                    Text("Sent it as a zip? AirDrop or save model_textured.glb (or phone_model.glb) from Studio's results folder, then pick it here.")
+                    Text("AirDrop or save model_textured.glb (or phone_model.glb if you chose Z up) from Studio's results folder to this phone, then pick it here.")
                 }
                 Section {
                     if let zipURL {
@@ -309,7 +313,10 @@ struct RawTransferView: View {
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         }
         .fileImporter(isPresented: $pickingFile, allowedContentTypes: [UTType(filenameExtension: "glb") ?? .data, .data]) { result in
-            if case let .success(url) = result { importFile(url) }
+            switch result {
+            case .success(let url): importFile(url)
+            case .failure(let error): importError = "Couldn't open that file: \(error.localizedDescription)"
+            }
         }
         .task {
             // Follow Studio's progress while this screen is open.
@@ -364,7 +371,7 @@ struct RawTransferView: View {
 
     private func fetch() {
         guard let link else { return }
-        fetching = true; importError = nil
+        fetching = true; importError = nil; imported = nil
         let folder = ProjectStore.folder(for: project.id)
         Task {
             do {
@@ -386,7 +393,7 @@ struct RawTransferView: View {
     }
 
     private func importFile(_ url: URL) {
-        importError = nil
+        importError = nil; imported = nil; importing = true
         let folder = ProjectStore.folder(for: project.id)
         let access = url.startAccessingSecurityScopedResource()
         Task {
@@ -397,6 +404,7 @@ struct RawTransferView: View {
                 importError = error.localizedDescription
             }
             if access { url.stopAccessingSecurityScopedResource() }
+            importing = false
         }
     }
 

@@ -16,7 +16,7 @@ from PIL import Image, ImageDraw
 from .capture import Frame
 
 Report = Callable[[str, float], None]
-K = 6     # candidate photos remembered per triangle
+K = 8     # candidate photos remembered per triangle
 
 
 def _load(frame: Frame) -> np.ndarray:
@@ -75,78 +75,171 @@ def _neighbours(F: np.ndarray) -> np.ndarray:
     return nb
 
 
-def bake(V: np.ndarray, F: np.ndarray, UV: np.ndarray, vertex_colors: np.ndarray | None,
-         frames: list[Frame], size: int, report: Report, base: float, span: float) -> tuple[np.ndarray, dict]:
-    """Returns the texture image (size x size x 3, row 0 = top, v = 1) and stats."""
+def _min_filter(a: np.ndarray, r: int) -> np.ndarray:
+    """Smallest value within r pixels (a square window), done one axis at a time."""
+    out = a.copy()
+    for s in range(1, r + 1):
+        np.minimum(out[:, s:], a[:, :-s], out=out[:, s:])
+        np.minimum(out[:, :-s], a[:, s:], out=out[:, :-s])
+    b = out.copy()
+    for s in range(1, r + 1):
+        np.minimum(out[s:], b[:-s], out=out[s:])
+        np.minimum(out[:-s], b[s:], out=out[:-s])
+    return out
+
+
+def raycast_depth(V: np.ndarray, F: np.ndarray):
+    """Returns render(frame, w, h): the model's depth (metres along the lens axis, inf where empty) as that photo
+    sees it. Used to tell which surfaces a photo really shows."""
     import open3d as o3d
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.core.Tensor(V.astype(np.float32)), o3d.core.Tensor(F.astype(np.uint32)))
+
+    def render(frame: Frame, w: int, h: int) -> np.ndarray:
+        k = frame.intrinsic(w / frame.width)
+        u, v = np.meshgrid(np.arange(w, dtype=np.float64), np.arange(h, dtype=np.float64))
+        d = np.stack([(u - k[0, 2]) / k[0, 0], (v - k[1, 2]) / k[1, 1], np.ones_like(u)], axis=-1)
+        c2w = np.linalg.inv(frame.extrinsic())
+        rays = np.concatenate([np.broadcast_to(c2w[:3, 3], d.shape), d @ c2w[:3, :3].T], axis=-1).astype(np.float32)
+        # The ray directions have length 1 along the lens axis, so the hit distance is the depth.
+        return scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
+
+    return render
+
+
+DEPTH_W = 640      # width of the model depth picture used for the "is it hidden" test
+EDGE_R = 5         # pixels of that picture kept clear around anything nearer (poses are never perfect)
+
+
+def score_photos(V, F, frames: list[Frame], depth_render, report: Report, base: float, span: float,
+                 state: dict | None = None, only: range | None = None) -> dict:
+    """For every triangle, the (up to K) photos that really show it, with a score each.
+    `state` carries a previous call's result on, and `only` limits this call to some photos, so the work can
+    be done in parts."""
     T = len(F)
     a, b, c = V[F[:, 0]], V[F[:, 1]], V[F[:, 2]]
     cent = (a + b + c) / 3
     n = np.cross(b - a, c - a)
     n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
-
-    scene = o3d.t.geometry.RaycastingScene()
-    scene.add_triangles(o3d.core.Tensor(V.astype(np.float32)), o3d.core.Tensor(F.astype(np.uint32)))
-
+    del a, b, c
+    if state is None:
+        state = {"L": np.full((T, K), -1, np.int32), "S": np.zeros((T, K), np.float32), "hidden": 0, "changed": 0}
+    bestL, bestS = state["L"], state["S"]
     sharp = np.array([max(f.sharpness, 1.0) for f in frames])
     sharp_w = np.clip(np.sqrt(sharp / np.median(sharp)), 0.4, 1.5)
-    bestL = np.full((T, K), -1, np.int32)
-    bestS = np.zeros((T, K), np.float32)
 
-    # 1. Score every photo for every triangle it can see.
     for pi, f in enumerate(frames):
+        if only is not None and pi not in only:
+            continue
         if pi % 10 == 0:
-            report(f"Texturing: checking which photos see each surface ({pi + 1} of {len(frames)})", base + span * 0.25 * pi / len(frames))
+            report(f"Texturing: checking which photos see each surface ({pi + 1} of {len(frames)})", base + span * pi / len(frames))
         u, v, z = _project(f, cent, f.width)
         cam = f.position()
         to_cam = cam - cent
         dist = np.linalg.norm(to_cam, axis=1)
         facing = np.abs(np.einsum("ij,ij->i", n, to_cam)) / np.maximum(dist, 1e-6)
-        m = (z > 0.15) & (z < 6) & (u > 4) & (v > 4) & (u < f.width - 5) & (v < f.height - 5) & (facing > 0.3)
+        m = (z > 0.15) & (z < 8) & (u > 4) & (v > 4) & (u < f.width - 5) & (v < f.height - 5) & (facing > 0.12)
         idx = np.nonzero(m)[0]
         if not len(idx):
             continue
-        # Blocked? Cast a ray from the camera to the triangle; it must reach (almost) the triangle itself.
-        d = cent[idx] - cam
-        rays = np.concatenate([np.broadcast_to(cam, d.shape), d], axis=1).astype(np.float32)
-        hit = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
-        vis = hit >= 1.0 - 0.015 / np.maximum(dist[idx], 0.1)
-        idx = idx[vis]
+        zi, fi = z[idx], facing[idx]
+        slope = np.sqrt(np.maximum(1 - fi * fi, 0)) / fi            # how fast depth changes across the surface
+
+        # Hidden? Nothing in the model may be nearer to the camera at that spot, or within a few pixels of it:
+        # the photo's position is never perfect, and without the margin the edge of a chair or a person is
+        # painted onto the wall behind.
+        dw = DEPTH_W
+        dh = max(1, round(dw * f.height / f.width))
+        s = dw / f.width
+        near = _min_filter(depth_render(f, dw, dh), EDGE_R)
+        px = np.clip(np.rint((u[idx] + 0.5) * s - 0.5).astype(np.int64), 0, dw - 1)
+        py = np.clip(np.rint((v[idx] + 0.5) * s - 0.5).astype(np.int64), 0, dh - 1)
+        tol = 0.02 + 0.01 * zi + EDGE_R * zi * slope / (f.fx * s)
+        vis = zi <= near[py, px] + tol
+        state["hidden"] += int((~vis).sum())
+
+        # Was the surface there when this photo was taken? The photo's own LiDAR depth must agree with the
+        # model. This keeps people who walked through, and anything that moved, out of the texture.
+        weight = np.ones(len(idx), np.float32)
+        if f.depth_width and f.depth.exists():
+            sd = f.load_depth(1, 9.0)
+            sd = _min_filter(np.where(sd > 0, sd, np.inf).astype(np.float32), 1)
+            s2 = f.depth_width / f.width
+            qx = np.clip(np.rint((u[idx] + 0.5) * s2 - 0.5).astype(np.int64), 0, f.depth_width - 1)
+            qy = np.clip(np.rint((v[idx] + 0.5) * s2 - 0.5).astype(np.int64), 0, f.depth_height - 1)
+            d = sd[qy, qx]
+            known = np.isfinite(d)
+            tol2 = 0.04 + 0.02 * zi + 1.5 * zi * slope / (f.fx * s2)
+            same = ~known | (np.abs(d - zi) <= tol2)
+            state["changed"] += int((vis & ~same).sum())
+            vis &= same
+            weight[~known] = 0.6          # not checked by LiDAR (too far or unsure): allowed, but not preferred
+        idx, zi, fi, weight = idx[vis], zi[vis], fi[vis], weight[vis]
         if not len(idx):
             continue
-        cu = u[idx] / f.width - 0.5
-        cv = v[idx] / f.height - 0.5
-        centred = 1 - 0.8 * (cu * cu + cv * cv)
-        s = (facing[idx] ** 3 * centred * sharp_w[pi] / (0.3 + z[idx]) ** 2).astype(np.float32)
+        cu = 2 * u[idx] / f.width - 1
+        cv = 2 * v[idx] / f.height - 1
+        # Fades to nothing at the photo's edge, so neighbouring photos take over gradually.
+        centred = np.sqrt(np.maximum((1 - cu * cu) * (1 - cv * cv), 0))
+        sc = (fi ** 3 * centred * weight * sharp_w[pi] / (0.3 + zi) ** 2).astype(np.float32)
         col = np.argmin(bestS[idx], axis=1)
-        better = s > bestS[idx, col]
-        idx, col, s = idx[better], col[better], s[better]
+        better = sc > bestS[idx, col]
+        idx, col, sc = idx[better], col[better], sc[better]
         bestL[idx, col] = pi
-        bestS[idx, col] = s
+        bestS[idx, col] = sc
+    return state
 
+
+def choose_photos(V, F, frames, state: dict, report: Report, base: float, span: float):
+    """The photo each triangle is painted from (-1 = none), per-photo gains and per-corner colour offsets."""
+    bestL, bestS = state["L"], state["S"]
+    T = len(F)
+    cent = (V[F[:, 0]] + V[F[:, 1]] + V[F[:, 2]]) / 3
     label = bestL[np.arange(T), np.argmax(bestS, axis=1)]
     label[bestS.max(axis=1) <= 0] = -1
     top = bestS.max(axis=1)
 
-    # 2. Follow the neighbours' photo where it also sees the triangle well: bigger patches, fewer seams.
-    report("Texturing: joining patches", base + span * 0.3)
+    # Follow the neighbours' photo where it also sees the triangle well: bigger patches, fewer seams.
+    report("Texturing: joining patches", base)
     nb = _neighbours(F)
-    for _ in range(10):
+    for _ in range(20):
         nl = np.where(nb >= 0, label[np.maximum(nb, 0)], -1)
         cand = np.where((nl[:, 0] == nl[:, 1]) | (nl[:, 0] == nl[:, 2]), nl[:, 0],
                         np.where(nl[:, 1] == nl[:, 2], nl[:, 1], -1))
         score = np.where(bestL == cand[:, None], bestS, 0).max(axis=1)
-        switch = (cand >= 0) & (cand != label) & (score >= 0.35 * top)
+        switch = (cand >= 0) & (cand != label) & (score > 0) & (score >= 0.35 * top)
         if not switch.any():
             break
         label[switch] = cand[switch]
+    del nb
 
-    # 3. Brightness: one gain per photo that brings its view of shared surfaces to the average of all views.
-    report("Texturing: matching photo brightness", base + span * 0.35)
-    gains = _exposure_gains(frames, cent, bestL, bestS, report, base + span * 0.35, span * 0.15)
+    # Brightness: one gain per photo, then a gentle correction that varies across each patch, so patches from
+    # different photos meet without a visible step.
+    report("Texturing: matching photo brightness", base + span * 0.2)
+    gains, offsets = _match_colours(frames, cent, F, bestL, bestS, label, report, base + span * 0.2, span * 0.8)
+    return label, gains, offsets
 
-    # 4. Which texel belongs to which triangle.
-    report("Texturing: laying out the texture", base + span * 0.5)
+
+def bake(V: np.ndarray, F: np.ndarray, UV: np.ndarray, vertex_colors: np.ndarray | None,
+         frames: list[Frame], size: int, report: Report, base: float, span: float,
+         depth_render=None) -> tuple[np.ndarray, dict]:
+    """Returns the texture image (size x size x 3, row 0 = top, v = 1) and stats."""
+    if depth_render is None:
+        depth_render = raycast_depth(V, F)
+    state = score_photos(V, F, frames, depth_render, report, base, span * 0.3)
+    label, gains, offsets = choose_photos(V, F, frames, state, report, base + span * 0.3, span * 0.2)
+    tex, used = paint(V, F, UV, vertex_colors, frames, label, gains, offsets, size, report, base + span * 0.5, span * 0.5)
+    stats = {"texture_photos": used, "untextured_triangles": int((label < 0).sum()),
+             "triangles": int(len(F)), "texture_size": size,
+             "views_rejected_hidden": state["hidden"], "views_rejected_changed": state["changed"]}
+    return tex, stats
+
+
+def paint(V, F, UV, vertex_colors, frames, label, gains, offsets, size: int, report: Report, base: float, span: float):
+    """Fills the texture image: every texel from the photo its triangle was given."""
+    T = len(F)
+    # Which texel belongs to which triangle.
+    report("Texturing: laying out the texture", base)
     px = UV.copy()
     px[..., 0] *= size
     px[..., 1] = (1 - px[..., 1]) * size
@@ -164,6 +257,7 @@ def bake(V: np.ndarray, F: np.ndarray, UV: np.ndarray, vertex_colors: np.ndarray
     tri_of = idmap.ravel()[filled] - 1
     del idmap
     lab = label[tri_of]
+    painted = np.zeros(size * size, bool)
 
     # Barycentric coordinates of each texel centre in its triangle (clamped for the 1-texel border).
     def bary(sel):
@@ -188,18 +282,21 @@ def bake(V: np.ndarray, F: np.ndarray, UV: np.ndarray, vertex_colors: np.ndarray
     # Texels no photo saw: the fused colour, so nothing is left black.
     none = np.nonzero(lab < 0)[0]
     if len(none) and vertex_colors is not None and len(vertex_colors) == len(V):
-        t, l0, l1, l2 = bary(none)
-        col = vertex_colors[F[t, 0]] * l0 + vertex_colors[F[t, 1]] * l1 + vertex_colors[F[t, 2]] * l2
-        tex.reshape(-1, 3)[filled[none]] = np.clip(col * 255, 0, 255).astype(np.uint8)
+        for lo in range(0, len(none), 4_000_000):
+            part = none[lo:lo + 4_000_000]
+            t, l0, l1, l2 = bary(part)
+            col = vertex_colors[F[t, 0]] * l0 + vertex_colors[F[t, 1]] * l1 + vertex_colors[F[t, 2]] * l2
+            tex.reshape(-1, 3)[filled[part]] = np.clip(col * 255, 0, 255).astype(np.uint8)
+            painted[filled[part]] = True
 
-    # 5. Sample every texel from its photo at full resolution, a few photos at a time to keep memory modest.
+    # Sample every texel from its photo at full resolution, one photo at a time to keep memory modest.
     order = np.argsort(lab, kind="stable")
     lab_sorted = lab[order]
     used = np.unique(lab_sorted[lab_sorted >= 0])
     flat = tex.reshape(-1, 3)
     for i, pi in enumerate(used):
         if i % 5 == 0:
-            report(f"Texturing: painting from photos ({i + 1} of {len(used)})", base + span * (0.55 + 0.45 * i / len(used)))
+            report(f"Texturing: painting from photos ({i + 1} of {len(used)})", base + span * (0.1 + 0.85 * i / len(used)))
         lo, hi = np.searchsorted(lab_sorted, [pi, pi + 1])
         sel = order[lo:hi]
         f = frames[pi]
@@ -208,48 +305,142 @@ def bake(V: np.ndarray, F: np.ndarray, UV: np.ndarray, vertex_colors: np.ndarray
         P = V[F[t, 0]] * l0 + V[F[t, 1]] * l1 + V[F[t, 2]] * l2
         u, v, _ = _project(f, P, img.shape[1])
         col = _bilinear(img, u, v) * gains[pi]
+        col += offsets[t, 0] * l0 + offsets[t, 1] * l1 + offsets[t, 2] * l2
         flat[filled[sel]] = np.clip(col, 0, 255).astype(np.uint8)
+        painted[filled[sel]] = True
         del img
 
-    stats = {"texture_photos": int(len(used)), "untextured_triangles": int((label < 0).sum()),
-             "triangles": int(T), "texture_size": size}
-    return tex, stats
+    # Spread colour into the empty gaps between patches, so no dark lines show where patches meet when the
+    #    texture is seen from far away (viewers average neighbouring texels).
+    report("Texturing: filling gaps between patches", base + span * 0.96)
+    del filled, tri_of, lab, order, lab_sorted
+    _fill_gaps(tex, painted.reshape(size, size))
+
+    return tex, int(len(used))
 
 
-def _exposure_gains(frames, cent, bestL, bestS, report, base, span) -> np.ndarray:
-    T = len(cent)
-    rng = np.random.default_rng(0)
-    sample = rng.choice(T, size=min(T, 40000), replace=False)
-    L = bestL[sample]
-    S = bestS[sample]
-    colours = np.full(L.shape + (3,), np.nan, np.float32)
-    photos = np.unique(L[L >= 0])
+def _small_photo(f: Frame, factor: int = 8) -> np.ndarray:
+    with Image.open(f.image) as im:
+        w, h = max(1, f.width // factor), max(1, f.height // factor)
+        im.draft("RGB", (w, h))
+        return np.asarray(im.convert("RGB").resize((w, h), Image.BILINEAR))
+
+
+def _match_colours(frames, cent, F, bestL, bestS, label, report, base, span):
+    """Per-photo gains (T photos x 3) and per-corner colour offsets (triangles x 3 corners x 3).
+
+    Every triangle knows up to K photos that see it. Their colours there (from small copies of the photos, so
+    only the overall tone counts, not detail) should agree. First each photo gets one gain that brings it to
+    the average. Then, for the photo each triangle is painted from, the remaining difference from the agreed
+    colour becomes a smooth correction across the patch."""
+    T, k = bestL.shape
+    colours = np.full((T, k, 3), np.nan, np.float32)
+    flat_l = bestL.ravel()
+    order = np.argsort(flat_l, kind="stable")
+    sorted_l = flat_l[order]
+    photos = np.unique(sorted_l[sorted_l >= 0])
     for i, pi in enumerate(photos):
         if i % 20 == 0:
             report(f"Texturing: matching photo brightness ({i + 1} of {len(photos)})", base + span * i / max(1, len(photos)))
-        rows, cols = np.nonzero(L == pi)
+        lo, hi = np.searchsorted(sorted_l, [pi, pi + 1])
+        rows, cols = np.divmod(order[lo:hi], k)
         f = frames[pi]
-        with Image.open(f.image) as im:
-            w = f.width // 4
-            im.draft("RGB", (w, f.height // 4))
-            img = np.asarray(im.convert("RGB").resize((w, f.height // 4)))
-        u, v, _ = _project(f, cent[sample[rows]], img.shape[1])
+        img = _small_photo(f)
+        u, v, _ = _project(f, cent[rows], img.shape[1])
         colours[rows, cols] = _bilinear(img, u, v)
-    valid = ~np.isnan(colours[..., 0]) & (S > 0)
-    # Ignore clipped and near-black samples; they say nothing about exposure.
-    br = np.nan_to_num(colours.max(axis=-1))
-    dk = np.nan_to_num(colours.min(axis=-1))
-    valid &= (br < 245) & (dk > 8)
-    count = valid.sum(axis=1)
-    mean = np.where(valid[..., None], np.nan_to_num(colours), 0).sum(axis=1) / np.maximum(count, 1)[:, None]
-    num = np.zeros((len(frames), 3))
-    den = np.zeros((len(frames), 3))
-    for k in range(L.shape[1]):
-        m = valid[:, k] & (count >= 2)
-        np.add.at(num, L[m, k], mean[m])
-        np.add.at(den, L[m, k], colours[m, k])
-    g = np.where(den > 0, num / np.maximum(den, 1e-6), 1.0)
-    return np.clip(g, 0.6, 1.6).astype(np.float32)
+    seen = ~np.isnan(colours[..., 0]) & (bestS > 0)
+    colours = np.nan_to_num(colours)
+    # Clipped and near-black samples say nothing about exposure.
+    usable = seen & (colours.max(axis=-1) < 245) & (colours.min(axis=-1) > 8)
+
+    def agreed(c, w):
+        """Weighted mean over each triangle's photos, then again with outliers (reflections, things that moved)
+        turned down."""
+        tot = np.maximum(w.sum(axis=1), 1e-9)[:, None]
+        mean = (c * w[..., None]).sum(axis=1) / tot
+        dev = np.abs(c - mean[:, None]).max(axis=-1)
+        w2 = w / (1 + (dev / 25.0) ** 2)
+        tot2 = np.maximum(w2.sum(axis=1), 1e-9)[:, None]
+        mean = (c * w2[..., None]).sum(axis=1) / tot2
+        spread = np.sqrt((((c - mean[:, None]) ** 2).max(axis=-1) * w2).sum(axis=1) / tot2[:, 0])
+        return mean, spread
+
+    # Gains: two rounds, each bringing every photo to the agreed colour of the surfaces it shares with others.
+    gains = np.ones((len(frames), 3), np.float64)
+    w = np.where(usable, bestS, 0).astype(np.float32)
+    many = (usable.sum(axis=1) >= 2)
+    safe_l = np.maximum(bestL, 0)
+    for _ in range(2):
+        c = colours * gains[safe_l].astype(np.float32)
+        mean, _ = agreed(c, w)
+        num = np.zeros((len(frames), 3))
+        den = np.zeros((len(frames), 3))
+        for j in range(k):
+            m = usable[:, j] & many
+            np.add.at(num, bestL[m, j], mean[m] * w[m, j, None])
+            np.add.at(den, bestL[m, j], c[m, j] * w[m, j, None])
+        step = np.where(den > 0, num / np.maximum(den, 1e-6), 1.0)
+        gains = np.clip(gains * step, 0.6, 1.6)
+    gains = gains.astype(np.float32)
+
+    # Offsets: what is still missing between the photo a triangle is painted from and the agreed colour.
+    c = colours * gains[safe_l]
+    mean, spread = agreed(c, w)
+    mine = (bestL == label[:, None]) & usable
+    has = mine.any(axis=1) & many & (label >= 0)
+    own = (c * mine[..., None]).sum(axis=1) / np.maximum(mine.sum(axis=1), 1)[:, None]
+    off = np.where(has[:, None], mean - own, 0).astype(np.float32)
+    off /= (1 + (spread / 30.0) ** 2)[:, None]          # where photos disagree a lot, trust the correction less
+    np.clip(off, -60, 60, out=off)
+    del colours, c
+
+    # Smooth it across each patch: average onto (vertex, photo) pairs and back, a few times.
+    nl = int(label.max()) + 2 if len(label) else 1
+    key = F.astype(np.int64) * nl + (label[:, None].astype(np.int64) + 1)
+    uniq, inv = np.unique(key.ravel(), return_inverse=True)
+    inv = inv.reshape(-1, 3)
+    count = np.bincount(inv.ravel(), minlength=len(uniq)).astype(np.float32)
+    corner = np.zeros((len(uniq), 3), np.float32)
+    for it in range(3):
+        for ch in range(3):
+            corner[:, ch] = np.bincount(inv.ravel(), weights=np.repeat(off[:, ch], 3), minlength=len(uniq)) / np.maximum(count, 1)
+        off = corner[inv].mean(axis=1)
+    offsets = corner[inv]                # (T, 3 corners, 3 channels)
+    offsets[label < 0] = 0
+    return gains, offsets.astype(np.float32)
+
+
+def _fill_gaps(tex: np.ndarray, painted: np.ndarray):
+    """Push-pull: every empty texel takes the average colour of the nearest painted area. Works in place."""
+    size = tex.shape[0]
+    if size & (size - 1) or tex.shape[1] != size or painted.all():
+        return
+    # Level 1 (half size) sums, built in strips so the full-size float copy never exists.
+    half = size // 2
+    csum = np.zeros((half, half, 3), np.float32)
+    wsum = np.zeros((half, half), np.float32)
+    strip = 512
+    for y in range(0, size, strip):
+        m = painted[y:y + strip]
+        t = tex[y:y + strip].astype(np.float32) * m[..., None]
+        csum[y // 2:(y + strip) // 2] = t.reshape(-1, 2, half, 2, 3).sum(axis=(1, 3))
+        wsum[y // 2:(y + strip) // 2] = m.reshape(-1, 2, half, 2).sum(axis=(1, 3))
+    cs, ws = [csum], [wsum]
+    while cs[-1].shape[0] > 1:
+        h = cs[-1].shape[0] // 2
+        cs.append(cs[-1].reshape(h, 2, h, 2, 3).sum(axis=(1, 3)))
+        ws.append(ws[-1].reshape(h, 2, h, 2).sum(axis=(1, 3)))
+    # Push down: a level's empty cells take the colour of the coarser level above them.
+    colour = cs[-1] / np.maximum(ws[-1], 1e-6)[..., None]
+    for lvl in range(len(cs) - 2, -1, -1):
+        up = colour.repeat(2, axis=0).repeat(2, axis=1)
+        have = ws[lvl] > 0
+        colour = np.where(have[..., None], cs[lvl] / np.maximum(ws[lvl], 1e-6)[..., None], up)
+    for y in range(0, size, strip):
+        m = painted[y:y + strip]
+        up = colour[y // 2:(y + strip) // 2].repeat(2, axis=0).repeat(2, axis=1)
+        block = tex[y:y + strip]
+        block[~m] = np.clip(up[~m], 0, 255).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------------------------- writers
@@ -296,6 +487,7 @@ def write_glb(path, V, F, UV, normals, jpeg: bytes):
                        "extensions": {"KHR_materials_unlit": {}}, "doubleSided": True}],
         "textures": [{"source": 0, "sampler": 0}], "samplers": [{"magFilter": 9729, "minFilter": 9987}],
         "images": [{"bufferView": 4, "mimeType": "image/jpeg"}],
+        "bufferViews": views,
         "accessors": [
             {"bufferView": 0, "componentType": 5126, "count": len(pos), "type": "VEC3", "min": pos.min(0).tolist(), "max": pos.max(0).tolist()},
             {"bufferView": 1, "componentType": 5126, "count": len(nor), "type": "VEC3"},

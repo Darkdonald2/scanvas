@@ -198,6 +198,7 @@ class StudioApp:
             self.events.put(("log", f"Saved to {folder}. Open it with “Open raw folder…” when you're ready."))
 
     def queue_job(self, path: Path, name: str, transfer: str = ""):
+        transfer = transfer or self.receiver.transfer_for(path)
         self.jobs.put((path, name, self.settings(), transfer))
         self.events.put(("log", f"Queued “{name}”."))
 

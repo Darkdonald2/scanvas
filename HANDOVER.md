@@ -121,6 +121,7 @@ Coordinates are ARKit's: Y up, metres, with the camera looking along −Z.
 
 `pipeline.process` runs these steps:
 
+0. Depth pixels on the outlines of things are dropped (`depth_edges`) wherever depth is fused or aligned.
 1. **Drift correction:** frames are moved by how much their nearest anchor has moved since they were taken.
 2. **Photo choice:** blur is judged relative to neighbouring frames, and the sharpest frame is kept per position.
 3. **Fuse:** Open3D `VoxelBlockGrid` TSDF at 2 cm (Fast), 1 cm (High) or 6 mm (Ultra). Colour is at half
@@ -131,10 +132,13 @@ Coordinates are ARKit's: Y up, metres, with the camera looking along −Z.
 6. **Texture** (`texturing.py`; this replaces Open3D's own `project_images_to_albedo`, which bled colour through
    objects):
    - decimate to 200k / 600k / 1.2M triangles, then `make_manifold`, then UVAtlas;
-   - score each triangle against each photo, with a raycast occlusion check, keeping the top 6;
+   - score each triangle against each photo, keeping the top 8. A photo only counts if nothing in the model is
+     nearer within a few pixels (a depth picture of the model per photo) and the photo's own LiDAR depth agrees
+     with the model there;
    - join patches with neighbours;
-   - per-photo brightness gains;
+   - per-photo brightness gains, then a smooth per-patch correction toward the colour the photos agree on;
    - rasterise texel→triangle ids with PIL, then sample every texel from its photo at full resolution;
+   - fill the gaps between patches so no dark lines show at a distance;
    - on failure, retry with half the triangles (twice) before falling back to the coloured mesh only.
 7. **Export:** `model_textured.obj/.mtl/.jpg`, `model_textured.glb` (unlit, texture embedded),
    `model_dense_colour.ply` and `point_cloud.ply`. Choosing Z up adds `phone_model.glb` in Y up. `processing.json`
@@ -179,6 +183,22 @@ to `main` trigger the builds. Studio-only changes don't rebuild the ipa.
 
 ## 8. Recent fixes (newest first)
 
+- **The phone couldn't import Studio's GLB** (5 November 2026). `write_glb` built the `bufferViews` table but
+  never put it in the file, so no program could read Studio's GLBs and the phone refused them. Fixed in Studio;
+  CI now reads the GLB back (`studio/tests/check_glb.py`). The phone's `StudioImport` also rebuilds the table
+  for files made by the old Studio, checks every offset, reads PNG textures, and the import screen now always
+  shows progress and errors.
+- **Studio texture quality** (same date), found by re-baking the user's Space 4 (see the comparison in the pull
+  request). Old problems: silhouettes of people and furniture painted onto the walls behind them, and plain
+  walls made of visibly different rectangles. Now a photo may only paint a surface if (a) nothing in the model
+  is nearer within a few pixels (`EDGE_R`), and (b) that photo's own LiDAR depth agrees the surface was there.
+  Patches are then levelled to the colour the photos agree on (`_match_colours`), gaps between patches are
+  filled (`_fill_gaps`), and all sharp photos are used (500 at High) instead of 200.
+- **Thin sheets hanging off the edges of people and furniture:** depth pixels on outlines are dropped before
+  fusing (`capture.depth_edges`). On Space 4 these sheets were most of the 25 % of triangles no photo could see.
+- **Studio remembers transfers** across restarts (`~/Scanvas Studio/transfers.json`), and processing a received
+  scan again by hand still reaches the phone's "Get processed model".
+- **Pull requests are built and tested** by both workflows without publishing a release.
 - **Studio texturing failed on real scans** with "UVAtlasPartition: Non-manifold mesh". Decimating a 9M-triangle
   mesh left vertices where separate sheets touch. Fixed with `make_manifold` (removes non-manifold edges and
   vertices), a single-partition UVAtlas fallback, and lighter retries.
@@ -197,9 +217,11 @@ to `main` trigger the builds. Studio-only changes don't rebuild the ipa.
 
 - Confirm on a real phone: "Get processed model" over Wi-Fi, and importing a 600k-triangle, 8192² model (about
   80 MB). Watch memory in the 3D viewer.
-- Studio forgets transfer status when it restarts. After a restart, or when a scan is reprocessed by hand, the
-  phone must use Import from Files. A next step would be to persist the status and link reprocessed results to
-  the transfer.
+- People who move during a scan still end up as rough shapes in the mesh. Their colour no longer leaks onto
+  the walls, but removing them from the geometry (masking with ARKit person segmentation at capture, or
+  dropping depth that disagrees with later frames) is not done yet.
+- Studio does not save its refined camera positions, so a texture can't be re-baked later without re-running
+  the whole pipeline. Saving them in the results folder would make that possible.
 - Phone viewer: a phone-textured scan has up to ten 4096² pages, which is about 700 MB+ of GPU memory. It could
   crash the 3D viewer on long scans; consider downsampled textures for viewing.
 - Studio's camera refinement can't remove slow drift around a loop. Pose-graph optimisation with loop closure is

@@ -5,6 +5,9 @@ on:
   push:
     branches: [main, master]
     paths: ["studio/**", ".github/workflows/build-studio.yml"]
+  # Pull requests are built and tested, but nothing is published.
+  pull_request:
+    paths: ["studio/**", ".github/workflows/build-studio.yml"]
   workflow_dispatch:
 permissions:
   contents: write
@@ -42,6 +45,7 @@ jobs:
           python tests/make_synthetic.py "$RUNNER_TEMP/synth" 30
           python run_studio.py "$RUNNER_TEMP/synth" --out "$RUNNER_TEMP/out" --quality fast
           python tests/evaluate.py "$RUNNER_TEMP/out" "$RUNNER_TEMP/synth"
+          python tests/check_glb.py "$RUNNER_TEMP/out/model_textured.glb"
       - name: Package
         run: |
           pyinstaller --noconfirm --clean --name "Scanvas Studio" --windowed \
@@ -66,6 +70,7 @@ jobs:
           path: studio/${{ matrix.asset }}
   publish:
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
