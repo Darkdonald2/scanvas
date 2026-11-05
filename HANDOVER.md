@@ -189,6 +189,11 @@ to `main` trigger the builds. Studio-only changes don't rebuild the ipa.
   `pipeline.align_to_phone_mesh` now slides every photo's depth onto `arkit_mesh.ply` first (coarse-to-fine
   ICP from 50 cm, starting from the previous photo's correction) and drops photos that fit nowhere. CI builds
   a synthetic scan whose first photos are 40 cm and 8° out and fails if the result isn't clean.
+  Checked on the user's real Space 3 (529 photos) with a stand-in for Open3D's ICP (`MeshMatcher` is
+  swappable for this): the first ~40 photos were 24 cm from the phone's mesh and ended under 1 cm, later
+  blocks went from 4-11 cm to 1-2 cm, and 3 photos at the very start were dropped. The same scan showed
+  that mesh anchors are sometimes re-created a metre away, so `capture._correct_drift` now ignores
+  mesh-anchor corrections over 30 cm.
 - **Raw capture changes** (same change): the app drops an `ARAnchor` on the camera's path about once a second
   and saves the nearest three per frame (`poseAnchors`) plus their final poses (`pose_anchors.json`); Studio
   prefers these over mesh anchors for drift correction. Raw photos now start only after tracking has been

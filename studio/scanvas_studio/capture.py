@@ -204,4 +204,8 @@ class Capture:
             if best is None:
                 continue
             correction = self.final_anchors[best] @ np.linalg.inv(f.anchors[best])
+            # ARKit sometimes re-creates a mesh anchor somewhere else, which looks like a jump of a metre or more
+            # and has nothing to do with drift (seen on a real scan); real corrections are far smaller.
+            if np.linalg.norm(correction[:3, 3] + (correction[:3, :3] - np.eye(3)) @ f.position()) > 0.3:
+                continue
             f.camera_to_world = correction @ f.camera_to_world

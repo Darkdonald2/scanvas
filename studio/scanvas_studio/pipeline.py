@@ -180,9 +180,8 @@ def fuse(frames: list[Frame], s: Settings, report: Report, base: float, span: fl
 
 # ---------------------------------------------------------------------------------------------- camera alignment
 
-def _depth_cloud(f: Frame, max_depth: float, target_points: int = 4000):
-    """A frame's reliable LiDAR depth as world points (at the frame's current position)."""
-    o3d = _o3d()
+def _depth_points(f: Frame, max_depth: float, target_points: int = 4000):
+    """A frame's reliable LiDAR depth as world points (at the frame's current position), or None if too few."""
     d = f.load_depth(2, max_depth, drop_edges=True)
     if np.count_nonzero(d) < 1500:
         d = f.load_depth(1, max_depth, drop_edges=True)
@@ -195,10 +194,49 @@ def _depth_cloud(f: Frame, max_depth: float, target_points: int = 4000):
     k = f.depth_intrinsic()
     pts = np.stack([(u - k[0, 2]) / k[0, 0] * z, (v - k[1, 2]) / k[1, 1] * z, z], axis=1)
     c2w = np.linalg.inv(f.extrinsic())
-    return o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts @ c2w[:3, :3].T + c2w[:3, 3]))
+    return pts @ c2w[:3, :3].T + c2w[:3, 3]
 
 
-def align_to_phone_mesh(folder: Path, frames: list[Frame], s: Settings, report: Report, base: float, span: float):
+class MeshMatcher:
+    """Fits clouds of points to the phone's mesh with Open3D. (Tests swap in their own with the same methods.)"""
+
+    def __init__(self, path: Path):
+        o3d = _o3d()
+        self.reg = o3d.pipelines.registration
+        self.o3d = o3d
+        self.target = None
+        if not Path(path).exists():
+            return
+        mesh = o3d.io.read_triangle_mesh(str(path))
+        if len(mesh.triangles) < 500:
+            return
+        try:
+            o3d.utility.random.seed(0)                 # same result every run
+        except Exception:
+            pass
+        n = int(min(1_500_000, max(100_000, mesh.get_surface_area() * 5000)))
+        self.target = mesh.sample_points_uniformly(number_of_points=n, use_triangle_normal=True).voxel_down_sample(0.02)
+        self.target.normalize_normals()
+
+    def cloud(self, points: np.ndarray):
+        return self.o3d.geometry.PointCloud(self.o3d.utility.Vector3dVector(points))
+
+    def evaluate(self, src, T: np.ndarray, within: float):
+        """(share of points within `within` metres of the mesh, their RMS distance)."""
+        e = self.reg.evaluate_registration(src, self.target, within, T)
+        return e.fitness, e.inlier_rmse
+
+    def icp(self, src, init: np.ndarray, ladder) -> np.ndarray:
+        reg, T = self.reg, init
+        for dist in ladder:
+            r = reg.registration_icp(src, self.target, dist, T, reg.TransformationEstimationPointToPlane(reg.TukeyLoss(k=dist)),
+                                     reg.ICPConvergenceCriteria(max_iteration=30))
+            T = r.transformation
+        return T
+
+
+def align_to_phone_mesh(folder: Path, frames: list[Frame], s: Settings, report: Report, base: float, span: float,
+                        matcher=None):
     """Moves each photo to where it fits the phone's own finished mesh, and drops photos that fit nowhere.
 
     While scanning, ARKit keeps correcting its map, and its mesh is rebuilt to match. The photos keep the
@@ -207,30 +245,23 @@ def align_to_phone_mesh(folder: Path, frames: list[Frame], s: Settings, report: 
     reference: each photo's depth is slid onto it (point-to-plane ICP, coarse to fine). The fine alignment
     against Studio's own fused surface comes afterwards.
     Returns the photos to use and a few numbers for the log."""
-    o3d = _o3d()
-    reg = o3d.pipelines.registration
-    path = Path(folder) / "arkit_mesh.ply"
-    if not path.exists():
-        return frames, {}
-    mesh = o3d.io.read_triangle_mesh(str(path))
-    if len(mesh.triangles) < 500:
-        return frames, {}
-    try:
-        o3d.utility.random.seed(0)                 # same result every run
-    except Exception:
-        pass
-    n = int(min(1_500_000, max(100_000, mesh.get_surface_area() * 5000)))
-    target = mesh.sample_points_uniformly(number_of_points=n, use_triangle_normal=True).voxel_down_sample(0.02)
-    target.normalize_normals()
+    if matcher is None:
+        matcher = MeshMatcher(Path(folder) / "arkit_mesh.ply")
+        if matcher.target is None:
+            return frames, {}
     check = 0.04                                   # a point "fits" when it is within 4 cm of the phone's mesh
 
+    class Fit:
+        def __init__(self, pair):
+            self.fitness, self.inlier_rmse = pair
+
     def icp(src, init, ladder):
-        T = init
-        for dist in ladder:
-            r = reg.registration_icp(src, target, dist, T, reg.TransformationEstimationPointToPlane(reg.TukeyLoss(k=dist)),
-                                     reg.ICPConvergenceCriteria(max_iteration=30))
-            T = r.transformation
-        return T, reg.evaluate_registration(src, target, check, T)
+        T = matcher.icp(src, init, ladder)
+        return T, Fit(matcher.evaluate(src, T, check))
+
+    def cloud(f):
+        pts = _depth_points(f, min(s.max_depth, 4.0))
+        return None if pts is None else matcher.cloud(pts)
 
     def accept(f, T, e0, e1):
         shift = float(np.linalg.norm(T[:3, 3] + (T[:3, :3] - np.eye(3)) @ f.position()))     # how far the camera moves
@@ -251,11 +282,11 @@ def align_to_phone_mesh(folder: Path, frames: list[Frame], s: Settings, report: 
         f = frames[i]
         if done % 10 == 0:
             report(f"Lining photos up with the phone's map ({done + 1} of {n_frames})", base + span * 0.85 * done / max(1, n_frames))
-        src = _depth_cloud(f, min(s.max_depth, 4.0))
+        src = cloud(f)
         if src is None:
             unusable[i] = True
             continue
-        e0 = reg.evaluate_registration(src, target, check, np.eye(4))
+        e0 = Fit(matcher.evaluate(src, np.eye(4), check))
         start[i] = fit[i] = e0.fitness
         if e0.fitness >= 0.85:
             tries = [icp(src, np.eye(4), (0.06, 0.03))]
@@ -275,8 +306,8 @@ def align_to_phone_mesh(folder: Path, frames: list[Frame], s: Settings, report: 
     for done, i in enumerate(poor):
         report(f"Lining photos up with the phone's map (second look, {done + 1} of {len(poor)})", base + span * (0.85 + 0.15 * done / len(poor)))
         f = frames[i]
-        src = _depth_cloud(f, min(s.max_depth, 4.0))
-        e0 = reg.evaluate_registration(src, target, check, np.eye(4))
+        src = cloud(f)
+        e0 = Fit(matcher.evaluate(src, np.eye(4), check))
         near = sorted((j for j in good if j != i), key=lambda j: abs(j - i))[:4]
         tries = [icp(src, fixes[j], (0.25, 0.12, 0.06, 0.03)) for j in near]
         if not tries:
