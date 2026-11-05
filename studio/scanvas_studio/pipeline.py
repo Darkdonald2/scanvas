@@ -215,6 +215,10 @@ def align_to_phone_mesh(folder: Path, frames: list[Frame], s: Settings, report: 
     mesh = o3d.io.read_triangle_mesh(str(path))
     if len(mesh.triangles) < 500:
         return frames, {}
+    try:
+        o3d.utility.random.seed(0)                 # same result every run
+    except Exception:
+        pass
     n = int(min(1_500_000, max(100_000, mesh.get_surface_area() * 5000)))
     target = mesh.sample_points_uniformly(number_of_points=n, use_triangle_normal=True).voxel_down_sample(0.02)
     target.normalize_normals()
@@ -228,47 +232,77 @@ def align_to_phone_mesh(folder: Path, frames: list[Frame], s: Settings, report: 
             T = r.transformation
         return T, reg.evaluate_registration(src, target, check, T)
 
-    original = [f.camera_to_world.copy() for f in frames]
+    def accept(f, T, e0, e1):
+        shift = float(np.linalg.norm(T[:3, 3] + (T[:3, :3] - np.eye(3)) @ f.position()))     # how far the camera moves
+        angle = math.degrees(math.acos(max(-1.0, min(1.0, (np.trace(T[:3, :3]) - 1) / 2))))
+        better = e1.fitness >= e0.fitness + 0.02 or (e1.fitness >= e0.fitness and e1.inlier_rmse < e0.inlier_rmse * 0.92)
+        return shift if (e1.fitness >= 0.45 and better and shift < 1.5 and angle < 20) else None
+
+    n_frames = len(frames)
+    fixes: list = [None] * n_frames              # the correction each photo gets
+    fit = np.zeros(n_frames)                     # how well it fits the phone's mesh in the end (0 to 1)
+    start = np.zeros(n_frames)
+    unusable = np.zeros(n_frames, bool)          # too little depth to judge
+    shifts = {}
+    # Newest first: the end of the scan is already in ARKit's final map, and the error grows towards the start,
+    # so each photo can begin from the correction the one after it needed.
     previous = np.eye(4)
-    keep, shifts = [], []
-    moved = dropped = 0
-    for i, f in enumerate(frames):
-        if i % 10 == 0:
-            report(f"Lining photos up with the phone's map ({i + 1} of {len(frames)})", base + span * i / max(1, len(frames)))
+    for done, i in enumerate(range(n_frames - 1, -1, -1)):
+        f = frames[i]
+        if done % 10 == 0:
+            report(f"Lining photos up with the phone's map ({done + 1} of {n_frames})", base + span * 0.85 * done / max(1, n_frames))
         src = _depth_cloud(f, min(s.max_depth, 4.0))
         if src is None:
-            keep.append(f)
+            unusable[i] = True
             continue
         e0 = reg.evaluate_registration(src, target, check, np.eye(4))
+        start[i] = fit[i] = e0.fitness
         if e0.fitness >= 0.85:
             tries = [icp(src, np.eye(4), (0.06, 0.03))]
         else:
             tries = [icp(src, np.eye(4), (0.5, 0.25, 0.12, 0.06, 0.03))]
             if not np.allclose(previous, np.eye(4)):
-                # Drift changes slowly, so the correction the photo before needed is a good place to start.
-                tries.append(icp(src, previous, (0.12, 0.06, 0.03)))
+                tries.append(icp(src, previous, (0.25, 0.12, 0.06, 0.03)))
         T, e1 = max(tries, key=lambda t: (round(t[1].fitness, 2), -t[1].inlier_rmse))
-        shift = float(np.linalg.norm(T[:3, 3] + (T[:3, :3] - np.eye(3)) @ f.position()))     # how far the camera moves
-        angle = math.degrees(math.acos(max(-1.0, min(1.0, (np.trace(T[:3, :3]) - 1) / 2))))
-        better = e1.fitness >= e0.fitness + 0.02 or (e1.fitness >= e0.fitness and e1.inlier_rmse < e0.inlier_rmse * 0.92)
-        if e1.fitness >= 0.45 and better and shift < 1.5 and angle < 20:
-            f.camera_to_world = T @ f.camera_to_world
-            previous = T
-            moved += 1
-            shifts.append(shift)
-            keep.append(f)
-        elif max(e0.fitness, e1.fitness) < 0.25:
-            dropped += 1                           # fits the map nowhere nearby: it would only add a ghost surface
-        else:
-            keep.append(f)
-    if dropped > 0.35 * len(frames):
-        # The phone's mesh doesn't match this capture well enough to judge by; leave everything as it was.
-        for f, m in zip(frames, original):
-            f.camera_to_world = m
+        shift = accept(f, T, e0, e1)
+        if shift is not None:
+            fixes[i], fit[i], shifts[i], previous = T, e1.fitness, shift, T
+
+    # Second chance for photos that still fit badly: start from what their nearest corrected neighbours needed.
+    good = [i for i in range(n_frames) if fixes[i] is not None]
+    typical = float(np.median(fit[~unusable])) if (~unusable).any() else 0.0
+    poor = [i for i in range(n_frames) if not unusable[i] and fit[i] < 0.8 * typical]
+    for done, i in enumerate(poor):
+        report(f"Lining photos up with the phone's map (second look, {done + 1} of {len(poor)})", base + span * (0.85 + 0.15 * done / len(poor)))
+        f = frames[i]
+        src = _depth_cloud(f, min(s.max_depth, 4.0))
+        e0 = reg.evaluate_registration(src, target, check, np.eye(4))
+        near = sorted((j for j in good if j != i), key=lambda j: abs(j - i))[:4]
+        tries = [icp(src, fixes[j], (0.25, 0.12, 0.06, 0.03)) for j in near]
+        if not tries:
+            continue
+        T, e1 = max(tries, key=lambda t: (round(t[1].fitness, 2), -t[1].inlier_rmse))
+        shift = accept(f, T, e0, e1)
+        if shift is not None and e1.fitness > fit[i]:
+            fixes[i], fit[i], shifts[i] = T, e1.fitness, shift
+
+    # A photo that still fits far worse than the rest would only add a second, misplaced copy of what it shows.
+    drop = ~unusable & (fit < max(0.25, 0.6 * typical))
+    if drop.sum() > 0.35 * n_frames:
         return frames, {"alignment_skipped": "the phone's mesh did not match the photos"}
-    stats = {"frames_aligned": moved, "frames_dropped": dropped}
-    if shifts:
-        stats["alignment_shift_cm"] = {"median": round(float(np.median(shifts)) * 100, 1), "largest": round(float(np.max(shifts)) * 100, 1)}
+    keep = []
+    for i, f in enumerate(frames):
+        if drop[i]:
+            continue
+        if fixes[i] is not None:
+            f.camera_to_world = fixes[i] @ f.camera_to_world
+        keep.append(f)
+    moved = [shifts[i] for i in shifts if not drop[i]]
+    stats = {"frames_aligned": len(moved), "frames_dropped": int(drop.sum()),
+             "fit_to_phone_mesh": {"before": round(float(np.median(start[~unusable])), 2) if (~unusable).any() else 0,
+                                   "after": round(typical, 2), "worst_kept": round(float(fit[~unusable & ~drop].min()), 2) if (~unusable & ~drop).any() else 0}}
+    if moved:
+        stats["alignment_shift_cm"] = {"median": round(float(np.median(moved)) * 100, 1), "largest": round(float(np.max(moved)) * 100, 1)}
     return keep, stats
 
 
