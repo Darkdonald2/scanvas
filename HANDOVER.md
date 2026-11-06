@@ -30,7 +30,7 @@ two parts:
 | --- | --- |
 | Source | GitHub repo `Darkdonald2/scanvas`, branch `main` (everything is committed there) |
 | iPhone app download | Release **`latest`** → `Scanvas.ipa` (rebuilt on every push to `main` that touches the app) |
-| Studio downloads | Release **`studio`** → `ScanvasStudio-mac-intel.zip`, `ScanvasStudio-mac-apple-silicon.zip`, `ScanvasStudio-windows.zip`, `ScanvasStudio-source.zip` |
+| Studio downloads | Release **`studio`** → `ScanvasStudio-mac-intel.zip`, `ScanvasStudio-windows.zip`, `ScanvasStudio-source.zip` |
 | Copies in the old project | `/mnt/project-files/scanvas/Scanvas.ipa` and `scanvas-source.zip` (these won't move with the account; the repo is the source of truth) |
 | Reference notes | `podium2-drainage-notes.md` (the user's earlier drainage drawing conventions; used only as reference for Pipes) |
 
@@ -164,7 +164,7 @@ Results go to `~/Scanvas Studio/Scans/`. Received raw scans are saved as `<name>
 
 **Studio:**
 
-- CI (`build-studio.yml`) runs a matrix of `macos-14` (Apple silicon), **`macos-15-intel` with `open3d==0.19.0`**
+- CI (`build-studio.yml`) runs a matrix of **`macos-15-intel` with `open3d==0.19.0`**
   and `windows-latest`.
 - On each runner it generates a synthetic scan, processes it, evaluates the result, packages with PyInstaller
   (`--collect-all open3d`; plotly and dash must stay included because Open3D imports them), and smoke-tests the
@@ -183,6 +183,9 @@ to `main` trigger the builds. Studio-only changes don't rebuild the ipa.
 
 ## 8. Recent fixes (newest first)
 
+- **Apple-silicon Studio build removed** (6 November 2026). The user only needs Intel, and GitHub's
+  `macos-14` machines were unavailable, which blocked the whole Studio release. To bring it back, add
+  `os: macos-14` / `asset: ScanvasStudio-mac-apple-silicon.zip` to the matrix in `build-studio.yml`.
 - **Doubled walls from camera drift** (5 November 2026, second change). ARKit corrects its map during a scan
   but photos keep the position they were taken at, so early photos can be tens of centimetres off. Studio's
   old refinement only accepted corrections under 8 cm against a first pass that was itself doubled.
