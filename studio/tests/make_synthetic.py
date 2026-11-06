@@ -42,8 +42,19 @@ def look_at(eye, target):
     return m
 
 
-def main(out: Path, frames=90, noise=0.01, width=960, height=720):
-    scene, _ = room()
+def phone_mesh(parts, rng):
+    """What ARKit's own mesh of the room would look like: the true surfaces, coarse and a little bumpy."""
+    whole = o3d.geometry.TriangleMesh()
+    for p in parts:
+        # Boxes are a dozen huge triangles; cut them down to roughly the size of ARKit's. The sphere is fine.
+        whole += p.subdivide_midpoint(number_of_iterations=5) if len(p.triangles) <= 12 else p
+    v = np.asarray(whole.vertices)
+    whole.vertices = o3d.utility.Vector3dVector(v + rng.normal(0, 0.006, v.shape))
+    return whole
+
+
+def main(out: Path, frames=90, noise=0.01, width=960, height=720, drift=0.0):
+    scene, parts = room()
     for sub in ("images", "depth", "confidence"):
         (out / sub).mkdir(parents=True, exist_ok=True)
     dw, dh = 256, 192
@@ -85,6 +96,16 @@ def main(out: Path, frames=90, noise=0.01, width=960, height=720):
         # Tracking error, as ARKit has: a small drift that grows around the loop plus jitter.
         noisy = c2w.copy()
         noisy[:3, 3] += rng.normal(0, noise, 3) + np.array([1, 0, 0.5]) * noise * np.sin(a)
+        if drift and i < frames * 0.3:
+            # The first part of the scan sits in ARKit's old, uncorrected map: shifted and turned as a whole,
+            # most at the start. This is what fuses walls twice.
+            k = 1 - i / (frames * 0.3)
+            ang = np.radians(8 * drift / 0.4) * k
+            R = np.array([[np.cos(ang), 0, np.sin(ang)], [0, 1, 0], [-np.sin(ang), 0, np.cos(ang)]])
+            old = np.eye(4)
+            old[:3, :3] = R
+            old[:3, 3] = np.array([drift, 0.1 * drift, -0.6 * drift]) * k
+            noisy = old @ noisy
         lines.append(json.dumps({
             "index": i, "timestamp": i * 0.2, "image": f"images/{name}.jpg", "depth": f"depth/{name}.bin",
             "confidence": f"confidence/{name}.bin", "width": width, "height": height, "depthWidth": dw, "depthHeight": dh,
@@ -93,9 +114,11 @@ def main(out: Path, frames=90, noise=0.01, width=960, height=720):
     (out / "anchors.json").write_text("{}")
     (out / "capture.json").write_text(json.dumps({"format": "scanvas-raw", "version": 1, "kind": "space", "frames": frames,
                                                   "imageWidth": width, "imageHeight": height, "depthWidth": dw, "depthHeight": dh}))
+    o3d.io.write_triangle_mesh(str(out / "arkit_mesh.ply"), phone_mesh(parts, rng))
     np.save(out / "truth_poses.npy", np.array(truth))
     print("wrote", frames, "frames to", out)
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]), frames=int(sys.argv[2]) if len(sys.argv) > 2 else 90)
+    main(Path(sys.argv[1]), frames=int(sys.argv[2]) if len(sys.argv) > 2 else 90,
+         drift=float(sys.argv[3]) if len(sys.argv) > 3 else 0.0)

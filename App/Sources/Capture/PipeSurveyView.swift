@@ -162,6 +162,7 @@ struct PipeSurveyView: View {
     }
 
     @ViewBuilder private var banners: some View {
+        RawStatusBadge(scanner: scanner)
         if scanner.tooFast {
             Label("Slow down", systemImage: "tortoise.fill").font(.headline)
                 .padding(.horizontal, 16).padding(.vertical, 8)
@@ -352,7 +353,7 @@ struct PipeSurveyView: View {
             }
             if let raw = scanner.raw {
                 report("Saving raw capture…", 0.005)
-                raw.finish(anchors: scanner.anchorTransforms(), mesh: collected, kind: "pipe")
+                raw.finish(anchors: scanner.anchorTransforms(), poseAnchors: scanner.poseAnchorTransforms(), mesh: collected, kind: "pipe")
             }
             do {
                 try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

@@ -11,12 +11,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 from make_synthetic import room, colour, look_at  # noqa: E402
 
 
-def main(out: Path, synth: Path):
+def main(out: Path, synth: Path, max_mean_mm: float = 0.0):
     scene, _ = room()
     dense = o3d.io.read_triangle_mesh(str(out / "model_dense_colour.ply"))
     v = np.asarray(dense.vertices, dtype=np.float32)
     dist = scene.compute_distance(o3d.core.Tensor(v)).numpy()
     print(f"surface error: mean {dist.mean() * 1000:.1f} mm, 95% {np.percentile(dist, 95) * 1000:.1f} mm, vertices {len(v):,}")
+    if max_mean_mm and dist.mean() * 1000 > max_mean_mm:
+        sys.exit(f"FAILED: mean surface error is above {max_mean_mm} mm")
 
     obj = out / "model_textured.obj"
     if not obj.exists():
@@ -56,4 +58,4 @@ def main(out: Path, synth: Path):
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]), Path(sys.argv[2]))
+    main(Path(sys.argv[1]), Path(sys.argv[2]), float(sys.argv[3]) if len(sys.argv) > 3 else 0.0)
