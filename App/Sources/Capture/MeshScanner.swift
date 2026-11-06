@@ -43,6 +43,12 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
     /// Raw capture for computer processing (nil when off).
     var raw: RawRecorder?
     @Published var rawFrames = 0
+    /// What raw capture is doing, for the scan screens to show.
+    enum RawState { case off, gettingReady, recording, paused }
+    @Published var rawState: RawState = .off
+    private var rawStateNow: RawState = .off
+    private var rawWaitSince: TimeInterval?
+    private var rawForced = false
     @Published var rawBytes: Int64 = 0
 
     private var keyframes: [Keyframe] = []
@@ -123,6 +129,10 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
         anchorLock.lock(); poseAnchors = [:]; anchorLock.unlock()
         lastPoseAnchor = nil
         normalSince = nil
+        rawWaitSince = nil
+        rawForced = false
+        rawStateNow = .off
+        rawState = .off
         startTime = Date()
         isScanning = true
     }
@@ -208,11 +218,29 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
         let steady = normalSince.map { now - $0 } ?? 0
         if lockExposure && !exposureLocked && isScanning && steady > 1.5 { setExposureLock(true) }
         // Raw photos start half a second after the exposure lock, so every one has the same brightness.
-        if isScanning, let raw, steady > 2.0 {
-            dropPoseAnchor(frame, now)
-            raw.consider(frame, turning: angularSpeed, walking: linearSpeed,
-                         anchors: { nearbyAnchors(frame.camera.transform) },
-                         poseAnchors: { nearbyPoseAnchors(frame.camera.transform) })
+        if isScanning, let raw {
+            var record = steady > 2.0
+            if record {
+                rawForced = false
+                rawWaitSince = nil
+            } else {
+                // Safety net: never keep the user waiting. If tracking hasn't settled within 6 seconds (it can
+                // flicker in dim or plain rooms), record anyway whenever tracking is normal, until it does settle.
+                if rawWaitSince == nil { rawWaitSince = now }
+                if now - (rawWaitSince ?? now) > 6 { rawForced = true }
+                record = rawForced && normalSince != nil
+            }
+            if record {
+                dropPoseAnchor(frame, now)
+                raw.consider(frame, turning: angularSpeed, walking: linearSpeed,
+                             anchors: { nearbyAnchors(frame.camera.transform) },
+                             poseAnchors: { nearbyPoseAnchors(frame.camera.transform) })
+            }
+            let state: RawState = record ? .recording : (raw.frameCount == 0 ? .gettingReady : .paused)
+            if state != rawStateNow {
+                rawStateNow = state
+                DispatchQueue.main.async { self.rawState = state }
+            }
         }
         if now - lastStatsTime > 0.5 {
             lastStatsTime = now

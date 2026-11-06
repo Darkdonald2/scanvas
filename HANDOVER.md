@@ -199,6 +199,10 @@ to `main` trigger the builds. Studio-only changes don't rebuild the ipa.
   prefers these over mesh anchors for drift correction. Raw photos now start only after tracking has been
   steady for 2 s (after the exposure lock at 1.5 s) and pause the same way after tracking is lost, photos
   taken while turning faster than about 70°/s are skipped, and each frame records mapping state and speeds.
+  The scan screens show what raw capture is doing (`MeshScanner.rawState`, `RawStatusBadge`): a yellow
+  "Getting ready" badge while waiting, a green "Recording raw photos" badge with a haptic tap when it starts,
+  and an orange badge when it pauses. Safety net: if tracking hasn't settled after 6 s, recording starts
+  anyway whenever tracking is normal. Finish refuses to save a raw scan with no photos.
   None of the capture changes has been tried on a phone yet.
 - **The phone couldn't import Studio's GLB** (5 November 2026). `write_glb` built the `bufferViews` table but
   never put it in the file, so no program could read Studio's GLBs and the phone refused them. Fixed in Studio;

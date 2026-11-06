@@ -162,6 +162,7 @@ struct PipeSurveyView: View {
     }
 
     @ViewBuilder private var banners: some View {
+        RawStatusBadge(scanner: scanner)
         if scanner.tooFast {
             Label("Slow down", systemImage: "tortoise.fill").font(.headline)
                 .padding(.horizontal, 16).padding(.vertical, 8)

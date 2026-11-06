@@ -43,6 +43,7 @@ struct MeshScanView: View {
                     .padding(.horizontal, 10).padding(.vertical, 6)
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
                 }
+                RawStatusBadge(scanner: scanner)
                 if scanner.tooFast {
                     Label("Slow down", systemImage: "tortoise.fill").font(.title3.bold())
                         .padding(.horizontal, 18).padding(.vertical, 10)
@@ -117,6 +118,11 @@ struct MeshScanView: View {
             errorMessage = "No mesh was captured yet. Keep scanning for a few seconds, then tap Finish again."
             return
         }
+        if let raw = scanner.raw, raw.frameCount == 0 {
+            saving = false
+            errorMessage = "No raw photos have been recorded yet. Keep scanning until the green Recording label shows, then tap Finish again."
+            return
+        }
         scanner.stop()
         let project = self.project
         let colour = captureColour
@@ -154,6 +160,45 @@ struct MeshScanView: View {
                     errorMessage = error.localizedDescription
                 }
             }
+        }
+    }
+}
+
+
+/// Tells the user what raw capture is doing: getting ready, recording, or paused.
+struct RawStatusBadge: View {
+    @ObservedObject var scanner: MeshScanner
+
+    var body: some View {
+        Group {
+            switch scanner.rawState {
+            case .off:
+                EmptyView()
+            case .gettingReady:
+                HStack(spacing: 8) {
+                    ProgressView().tint(.black)
+                    Text("Getting ready. Hold the phone still for a moment.")
+                }
+                .font(.callout.weight(.semibold)).foregroundStyle(.black)
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .background(.yellow.opacity(0.92), in: Capsule())
+            case .recording:
+                Label("Recording raw photos", systemImage: "record.circle.fill")
+                    .font(.footnote.weight(.semibold)).foregroundStyle(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(.green.opacity(0.85), in: Capsule())
+            case .paused:
+                Label("Raw photos paused. Move slowly until tracking recovers.", systemImage: "pause.circle.fill")
+                    .font(.callout.weight(.semibold)).foregroundStyle(.black)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(.orange.opacity(0.92), in: Capsule())
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: scanner.rawState)
+        .onChange(of: scanner.rawState) { _, state in
+            // A tap you can feel when recording starts, and a warning when it stops.
+            if state == .recording { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+            if state == .paused { UINotificationFeedbackGenerator().notificationOccurred(.warning) }
         }
     }
 }
