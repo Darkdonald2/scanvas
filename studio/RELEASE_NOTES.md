@@ -1,6 +1,6 @@
 Scanvas Studio turns raw scans from the Scanvas iPhone app into dense, photo-textured models on your computer.
 
-**Mac:** download `ScanvasStudio-mac-intel.zip` for an Intel Mac or `ScanvasStudio-mac-apple-silicon.zip` for an M1–M4 Mac, unzip, move *Scanvas Studio* to Applications. The first time, right-click it and choose **Open** (it isn't from the App Store).
+**Mac:** download `ScanvasStudio-mac-intel.zip` (built for Intel Macs), unzip, move *Scanvas Studio* to Applications. The first time, right-click it and choose **Open** (it isn't from the App Store).
 **Windows:** download `ScanvasStudio-windows.zip`, unzip, open the folder and run **Scanvas Studio.exe**. Allow it on private networks when Windows asks, so the iPhone can send scans.
 **Anything else:** download `ScanvasStudio-source.zip` and double-click the launcher for your system (needs Python 3.12 from python.org).
 

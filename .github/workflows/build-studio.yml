@@ -17,8 +17,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
-            asset: ScanvasStudio-mac-apple-silicon.zip
           - os: macos-15-intel
             asset: ScanvasStudio-mac-intel.zip
             # Open3D's newest release has no Intel Mac build; 0.19 does.
