@@ -603,7 +603,7 @@ struct PanoramaStitcher {
             }
         }
         let sigmaN = 10.0, sigmaG = 0.1
-        var gains = [SIMD3<Float>](repeating: SIMD3<Double>(1, 1, 1), count: n)
+        var gains = [SIMD3<Float>](repeating: SIMD3<Float>(1, 1, 1), count: n)
         for ch in 0..<3 {
             var A = [Double](repeating: 0, count: n * n)
             var b = [Double](repeating: 0, count: n)
@@ -725,9 +725,9 @@ struct PanoramaStitcher {
                 var acc = SIMD3<Float>(repeating: 0)
                 var wsum: Float = 0
                 for cam in near {
-                    if let (colour, weight) = sample(cam, d, power: grid.power) {
-                        acc += colour * weight
-                        wsum += weight
+                    if let hit = sample(cam, d, power: grid.power) {
+                        acc += hit.0 * hit.1
+                        wsum += hit.1
                     }
                 }
                 let o = pixels + (y * W + x) * 4
