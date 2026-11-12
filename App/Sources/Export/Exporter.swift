@@ -101,6 +101,8 @@ enum ExportFormat: String, CaseIterable, Identifiable {
             return [.usdz, .obj, .glb, .stl, .ply, .dxf3D, .ifc, .pts, .xyz]
         case .pipe:
             return [.pipeReport, .pipeDXF, .pipeIFC, .pipeCSV, .pipePNG, .obj, .usdz, .glb, .ply, .pts]
+        case .panorama:
+            return []          // shared straight from its own page
         }
     }
 

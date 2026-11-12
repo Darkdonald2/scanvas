@@ -6,6 +6,7 @@ enum ScanKind: String, Codable, CaseIterable {
     case space     // LiDAR mesh of any size of space
     case object    // Object Capture / photos → textured model
     case pipe      // Drainage pipe survey: traced runs + LiDAR scan + photos
+    case panorama  // 360 photo: guided shots stitched into an equirectangular panorama
 
     var title: String {
         switch self {
@@ -13,6 +14,7 @@ enum ScanKind: String, Codable, CaseIterable {
         case .space: return "Space"
         case .object: return "Object"
         case .pipe: return "Pipes"
+        case .panorama: return "360"
         }
     }
 
@@ -22,6 +24,7 @@ enum ScanKind: String, Codable, CaseIterable {
         case .space: return "cube.transparent"
         case .object: return "shippingbox"
         case .pipe: return "point.topleft.down.curvedto.point.bottomright.up"
+        case .panorama: return "pano"
         }
     }
 }
@@ -49,4 +52,6 @@ enum ProjectFile {
     static let checkpoint = "Checkpoint"
     static let pipes = "pipes.json"         // PipeSurvey
     static let pipePhotos = "PipePhotos"    // full-resolution survey photos
+    static let panorama = "panorama.jpg"    // stitched 360 photo (equirectangular, GPano tags)
+    static let panoShots = "PanoShots"      // the 360 capture's photos and shots.json, kept for stitching again
 }

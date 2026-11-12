@@ -1,9 +1,10 @@
 import SwiftUI
 import RoomPlan
 import RealityKit
+import ARKit
 
 enum CaptureMode: String, Identifiable {
-    case room, space, object, photos, measure, pipes
+    case room, space, object, photos, measure, pipes, panorama
     var id: String { rawValue }
 }
 
@@ -41,7 +42,11 @@ struct HomeView: View {
             }
             .navigationTitle("Scanvas")
             .navigationDestination(for: ScanProject.self) { p in
-                if p.kind == .pipe { PipeDetailView(project: p) } else { ProjectDetailView(project: p) }
+                switch p.kind {
+                case .pipe: PipeDetailView(project: p)
+                case .panorama: PanoramaDetailView(project: p)
+                default: ProjectDetailView(project: p)
+                }
             }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -59,6 +64,7 @@ struct HomeView: View {
                 case .photos: PhotosTo3DView(onSaved: open)
                 case .measure: MeasureView()
                 case .pipes: PipeSurveyView(onSaved: open)
+                case .panorama: PanoramaCaptureView(project: ScanProject(name: store.nextName(for: .panorama), kind: .panorama), onSaved: open)
                 }
             }
             .environmentObject(store)
@@ -101,6 +107,9 @@ struct HomeView: View {
                 ModeTile(title: "Measure", subtitle: "Tap-to-measure distances in AR", icon: "ruler", color: .pink) {
                     start(.measure, supported: true, reason: "")
                 }
+            }
+            ModeTile(title: "360 Photo", subtitle: "Guided photos all around you, stitched into a 360° panorama", icon: "pano", color: .yellow, wide: true) {
+                start(.panorama, supported: ARWorldTrackingConfiguration.isSupported, reason: "360 photos need ARKit, which this device doesn't support.")
             }
         }
     }
