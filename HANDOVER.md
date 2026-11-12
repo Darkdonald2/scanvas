@@ -183,6 +183,20 @@ to `main` trigger the builds. Studio-only changes don't rebuild the ipa.
 
 ## 8. Recent fixes (newest first)
 
+- **360 photo mode** (12 November 2026). `Panorama/PanoramaCapture.swift`: ARKit world tracking, 30 target
+  dots (12 at 0°, 8 at ±45°, zenith, nadir) drawn as RealityKit spheres 1.5 m out; lining up within 2.5° and
+  holding still for 0.4 s takes a `captureHighResolutionFrame`, saved as JPEG in `PanoShots/` with its
+  intrinsics and camera-to-world rotation in `shots.json`. Exposure and white balance lock after the first
+  photo. `PanoramaStitcher.swift` (Foundation/CoreGraphics/ImageIO/simd only): pairwise overlap matching on
+  192 px tangent-plane patches (NCC), a least-squares solve for one small rotation per photo (3 rounds, outlier
+  pairs dropped, reverted if it makes things worse), Brown-Lowe gain compensation, centre-weighted blending,
+  push-pull fill of unseen areas, JPEG with GPano XMP. Output 8192×4096 (6144 on phones under 6 GB).
+  `PanoramaViewer.swift`: custom inside-out sphere (same UV convention as the stitcher), drag/pinch, and a
+  CoreMotion "move the phone" mode. CI compiles the stitcher with `Tests/Panorama/main.swift` and checks it
+  against a synthetic scene before building the app.
+- **Object Capture** (same date): the capture session is now released before `PhotogrammetrySession` runs
+  (as in Apple's sample), start-up errors are shown, every state has a status, Apple's feedback is shown, and
+  fewer than 10 photos is refused. Neither change has run on a phone yet.
 - **Apple-silicon Studio build removed** (6 November 2026). The user only needs Intel, and GitHub's
   `macos-14` machines were unavailable, which blocked the whole Studio release. To bring it back, add
   `os: macos-14` / `asset: ScanvasStudio-mac-apple-silicon.zip` to the matrix in `build-studio.yml`.
