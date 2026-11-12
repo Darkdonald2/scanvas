@@ -16,6 +16,12 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      # The stitcher only needs Foundation, CoreGraphics, ImageIO and simd, so it is checked on its own first
+      # against a synthetic 360 scene (see Tests/Panorama/main.swift).
+      - name: Test the 360 stitcher
+        run: |
+          swiftc -O App/Sources/Panorama/PanoramaStitcher.swift Tests/Panorama/main.swift -o pano-test
+          ./pano-test
       - name: Build
         run: bash make-ipa.command
       - name: Report compile errors

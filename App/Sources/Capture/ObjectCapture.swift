@@ -60,57 +60,131 @@ enum Photogrammetry {
 final class ObjectCaptureModel: ObservableObject {
     @Published var state: ObjectCaptureSession.CaptureState = .initializing
     @Published var shots = 0
+    @Published var feedback: [String] = []
+    @Published var passComplete = false
     @Published var processing = false
     @Published var progress: Double = 0
+    @Published var step = "Building 3D model"
     @Published var errorMessage: String?
 
-    let session = ObjectCaptureSession()
+    /// Released before the model is built: Apple's capture session holds the camera and a lot of memory, and
+    /// building the model alongside it can stall or get the app closed.
+    @Published private(set) var session: ObjectCaptureSession?
     let project: ScanProject
     private var timer: Timer?
+    private var listener: Task<Void, Never>?
 
     init(project: ScanProject) { self.project = project }
 
     func start(store: ProjectStore) {
+        guard session == nil else { return }
         let folder = store.folder(for: project)
         let images = folder.appendingPathComponent(ProjectFile.images, isDirectory: true)
         let checkpoint = folder.appendingPathComponent(ProjectFile.checkpoint, isDirectory: true)
-        try? FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
-        try? FileManager.default.createDirectory(at: checkpoint, withIntermediateDirectories: true)
+        do {
+            try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: checkpoint, withIntermediateDirectories: true)
+        } catch {
+            errorMessage = "Couldn't make a folder for the photos: \(error.localizedDescription)"
+            return
+        }
+        let session = ObjectCaptureSession()
+        self.session = session
+        // Listen before starting, so no change of state is missed.
+        listener = Task { [weak self] in
+            for await s in session.stateUpdates {
+                self?.state = s
+            }
+        }
         var config = ObjectCaptureSession.Configuration()
         config.checkpointDirectory = checkpoint
         config.isOverCaptureEnabled = true
-        _ = try? session.start(imagesDirectory: images, configuration: config)
-        Task { [weak self] in
-            guard let self else { return }
-            for await s in self.session.stateUpdates {
-                self.state = s
-            }
+        do {
+            try session.start(imagesDirectory: images, configuration: config)
+        } catch {
+            errorMessage = "The camera couldn't start Object Capture: \(error.localizedDescription)"
+            return
         }
+        // Also read the state directly twice a second, in case an update is ever missed.
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                self.shots = self.session.numberOfShotsTaken
-            }
+            Task { @MainActor in self?.poll() }
         }
     }
 
-    func stopTimer() { timer?.invalidate(); timer = nil }
+    private func poll() {
+        guard let session else { return }
+        shots = session.numberOfShotsTaken
+        passComplete = session.userCompletedScanPass
+        feedback = session.feedback.compactMap(Self.message).sorted()
+        if !Self.same(session.state, state) { state = session.state }
+    }
+
+    private static func same(_ a: ObjectCaptureSession.CaptureState, _ b: ObjectCaptureSession.CaptureState) -> Bool {
+        switch (a, b) {
+        case (.initializing, .initializing), (.ready, .ready), (.detecting, .detecting), (.capturing, .capturing),
+             (.finishing, .finishing), (.completed, .completed), (.failed, .failed):
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func message(_ f: ObjectCaptureSession.Feedback) -> String? {
+        switch f {
+        case .objectTooClose: return "Move back a little"
+        case .objectTooFar: return "Move closer to the object"
+        case .movingTooFast: return "Move more slowly"
+        case .environmentLowLight: return "More light would help"
+        case .environmentTooDark: return "Too dark to capture"
+        case .outOfFieldOfView: return "Point the camera at the object"
+        case .overCapturing: return "This side is done, move on"
+        default: return nil
+        }
+    }
+
+    func stop() {
+        timer?.invalidate(); timer = nil
+        listener?.cancel(); listener = nil
+    }
+
+    func cancel() {
+        stop()
+        session?.cancel()
+        session = nil
+    }
 
     func process(store: ProjectStore) async -> ScanProject? {
-        stopTimer()
+        stop()
+        session = nil                      // release the camera and its memory before building
         processing = true
+        ProcessingMonitor.begin()
+        ProcessingMonitor.stage("Object Capture: building the model")
         let folder = store.folder(for: project)
+        let images = folder.appendingPathComponent(ProjectFile.images, isDirectory: true)
+        let count = ((try? FileManager.default.contentsOfDirectory(atPath: images.path)) ?? []).filter { !$0.hasPrefix(".") }.count
+        guard count >= 10 else {
+            processing = false
+            ProcessingMonitor.end()
+            errorMessage = "Only \(count) photos were saved, which isn't enough to build a model. Try again and walk all the way round the object."
+            return nil
+        }
         do {
+            step = "Building 3D model from \(count) photos"
             try await Photogrammetry.reconstruct(
-                images: folder.appendingPathComponent(ProjectFile.images, isDirectory: true),
+                images: images,
                 checkpoint: folder.appendingPathComponent(ProjectFile.checkpoint, isDirectory: true),
                 output: folder.appendingPathComponent(ProjectFile.model)) { p in
                     Task { @MainActor in self.progress = p }
                 }
-            return try await Photogrammetry.finishProject(project, store: store)
+            step = "Saving"
+            ProcessingMonitor.stage("Object Capture: saving")
+            let saved = try await Photogrammetry.finishProject(project, store: store)
+            ProcessingMonitor.end()
+            return saved
         } catch {
+            ProcessingMonitor.end()
             processing = false
-            errorMessage = error.localizedDescription
+            errorMessage = "Building the model failed: \(error.localizedDescription)"
             return nil
         }
     }
@@ -129,11 +203,14 @@ struct ObjectCaptureFlowView: View {
 
     var body: some View {
         ZStack {
+            Color.black.ignoresSafeArea()
             if model.processing {
-                ProcessingView(progress: model.progress, title: "Building 3D model")
+                ProcessingView(progress: model.progress, title: model.step)
             } else {
-                ObjectCaptureView(session: model.session).ignoresSafeArea()
-                VStack {
+                if let session = model.session {
+                    ObjectCaptureView(session: session).ignoresSafeArea()
+                }
+                VStack(spacing: 10) {
                     HStack {
                         Button("Cancel") { cancel() }.buttonStyle(.bordered).tint(.white)
                         Spacer()
@@ -144,23 +221,28 @@ struct ObjectCaptureFlowView: View {
                         }
                     }
                     .padding()
+                    ForEach(model.feedback, id: \.self) { text in
+                        Label(text, systemImage: "exclamationmark.circle.fill").font(.callout.weight(.semibold))
+                            .padding(.horizontal, 12).padding(.vertical, 6)
+                            .background(.orange.opacity(0.9), in: Capsule())
+                    }
                     Spacer()
                     controls.padding(.bottom, 30)
                 }
             }
         }
         .onAppear {
-            _ = try? store.makeFolder(for: model.project)
+            do { _ = try store.makeFolder(for: model.project) } catch { model.errorMessage = error.localizedDescription }
             model.start(store: store)
         }
-        .onDisappear { model.stopTimer() }
+        .onDisappear { model.stop() }
         .onChange(of: isCompleted) { _, done in
             guard done else { return }
             Task {
                 if let saved = await model.process(store: store) { onSaved(saved); dismiss() }
             }
         }
-        .alert("Object capture failed", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
+        .alert("Object Capture", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             Button("OK", role: .cancel) { cancel() }
         } message: { Text(model.errorMessage ?? "") }
     }
@@ -172,26 +254,41 @@ struct ObjectCaptureFlowView: View {
 
     @ViewBuilder private var controls: some View {
         switch model.state {
+        case .initializing:
+            HStack(spacing: 10) { ProgressView().tint(.white); Text("Starting the camera…") }
+                .padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
         case .ready:
-            bigButton("Continue", "viewfinder") { _ = model.session.startDetecting() }
-            hint("Point at the object you want to scan.")
+            VStack(spacing: 10) {
+                hint("Point the camera at the object, then tap Continue.")
+                bigButton("Continue", "viewfinder") { _ = model.session?.startDetecting() }
+            }
         case .detecting:
             VStack(spacing: 10) {
-                bigButton("Start capture", "camera.fill") { _ = model.session.startCapturing() }
-                Button("Reset box") { _ = model.session.resetDetection() }.buttonStyle(.bordered).tint(.white)
+                hint("Adjust the box around the object, then tap Start capture.")
+                bigButton("Start capture", "camera.fill") { _ = model.session?.startCapturing() }
+                Button("Reset box") { _ = model.session?.resetDetection() }.buttonStyle(.bordered).tint(.white)
             }
         case .capturing:
             VStack(spacing: 10) {
-                hint("Walk slowly around the object. Add a pass from a lower or higher angle for best results.")
+                hint(model.passComplete
+                     ? "Round complete. Tap New pass to go round again higher or lower, or Finish."
+                     : "Walk slowly all the way round the object. Photos are taken automatically.")
                 HStack {
-                    Button("New pass") { _ = model.session.beginNewScanPass() }.buttonStyle(.bordered).tint(.white)
-                    bigButton("Finish", "checkmark.circle.fill") { _ = model.session.finish() }
+                    Button("New pass") { _ = model.session?.beginNewScanPass() }.buttonStyle(.bordered).tint(.white)
+                    bigButton("Finish", "checkmark.circle.fill") { _ = model.session?.finish() }
+                        .disabled(model.shots < 10)
                 }
             }
         case .finishing:
-            ProgressView("Saving photos…").padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            HStack(spacing: 10) { ProgressView().tint(.white); Text("Saving photos…") }
+                .padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
         case .failed(let error):
-            Text(error.localizedDescription).padding().background(.red.opacity(0.8), in: RoundedRectangle(cornerRadius: 12))
+            VStack(spacing: 10) {
+                Text("Object Capture stopped: \(error.localizedDescription)").multilineTextAlignment(.center)
+                    .padding().background(.red.opacity(0.85), in: RoundedRectangle(cornerRadius: 12))
+                Button("Close") { cancel() }.buttonStyle(.borderedProminent)
+            }
+            .padding(.horizontal)
         default:
             EmptyView()
         }
@@ -209,8 +306,7 @@ struct ObjectCaptureFlowView: View {
     }
 
     private func cancel() {
-        model.stopTimer()
-        _ = model.session.cancel()
+        model.cancel()
         store.delete(model.project)
         dismiss()
     }
