@@ -288,7 +288,8 @@ struct PanoramaStitcher {
         var last: [Measurement] = []
         for round in 0...rounds {
             progress(Double(round) / Double(rounds + 1), "Lining photos up (round \(round + 1) of \(rounds + 1))")
-            let found = measure(sources, pairs: pairs)
+            // The first round searches up to about ±4°; after that what's left is small.
+            let found = measure(sources, pairs: pairs, reach: round == 0 ? 12 : 4)
             if round == 0 {
                 first = found
                 report.pairsMeasured = found.count
@@ -322,12 +323,12 @@ struct PanoramaStitcher {
     }
 
     /// Measures every pair that really overlaps and has enough detail to line up.
-    private static func measure(_ sources: [Source], pairs: [Pair]) -> [Measurement] {
+    private static func measure(_ sources: [Source], pairs: [Pair], reach: Int) -> [Measurement] {
         var results = [Measurement?](repeating: nil, count: pairs.count)
         let lock = NSLock()
         DispatchQueue.concurrentPerform(iterations: pairs.count) { n in
             let p = pairs[n]
-            let m = measurePair(sources[p.i], sources[p.j], i: p.i, j: p.j)
+            let m = measurePair(sources[p.i], sources[p.j], i: p.i, j: p.j, reach: reach)
             lock.lock(); results[n] = m; lock.unlock()
         }
         return results.compactMap { $0 }
@@ -341,7 +342,7 @@ struct PanoramaStitcher {
         return (r, u)
     }
 
-    private static func measurePair(_ si: Source, _ sj: Source, i: Int, j: Int) -> Measurement? {
+    private static func measurePair(_ si: Source, _ sj: Source, i: Int, j: Int, reach: Int) -> Measurement? {
         let c = simd_normalize(si.centre + sj.centre)
         let (r, u) = basis(c)
         let P = patch
@@ -356,7 +357,6 @@ struct PanoramaStitcher {
         let (hj, hmj) = halve(pj, mj, P)
         let h = P / 2
         var best = (score: -2.0, x: 0, y: 0)
-        let reach = 12
         for sy in -reach...reach {
             for sx in -reach...reach {
                 let s = ncc(hi, hmi, hj, hmj, size: h, sx: sx, sy: sy, minCount: h * h / 10)
