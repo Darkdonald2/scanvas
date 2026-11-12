@@ -28,13 +28,16 @@ func cellHash(_ i: Int, _ j: Int, _ c: Int) -> Double {
 func scene(_ d: SIMD3<Double>) -> SIMD3<Double> {
     let lon = atan2(d.x, -d.z), lat = asin(max(-1, min(1, d.y)))
     let i = Int(floor((lon + .pi) / (.pi / 24))), j = Int(floor((lat + .pi / 2) / (.pi / 24)))
-    let stripes = 25 * sin(lon * 37) * sin(lat * 41)
-    return SIMD3(40 + 170 * cellHash(i, j, 0) + stripes, 40 + 170 * cellHash(i, j, 1) + stripes, 40 + 170 * cellHash(i, j, 2) - stripes)
+    let stripes: Double = 25 * sin(lon * 37) * sin(lat * 41)
+    let r: Double = 40 + 170 * cellHash(i, j, 0) + stripes
+    let g: Double = 40 + 170 * cellHash(i, j, 1) + stripes
+    let b: Double = 40 + 170 * cellHash(i, j, 2) - stripes
+    return SIMD3<Double>(r, g, b)
 }
 
-func rotY(_ a: Double) -> simd_double3x3 { simd_double3x3(rows: [SIMD3(cos(a), 0, sin(a)), SIMD3(0, 1, 0), SIMD3(-sin(a), 0, cos(a))]) }
-func rotX(_ a: Double) -> simd_double3x3 { simd_double3x3(rows: [SIMD3(1, 0, 0), SIMD3(0, cos(a), -sin(a)), SIMD3(0, sin(a), cos(a))]) }
-func rotZ(_ a: Double) -> simd_double3x3 { simd_double3x3(rows: [SIMD3(cos(a), -sin(a), 0), SIMD3(sin(a), cos(a), 0), SIMD3(0, 0, 1)]) }
+func rotY(_ a: Double) -> simd_double3x3 { simd_double3x3(rows: [SIMD3<Double>(cos(a), 0, sin(a)), SIMD3<Double>(0, 1, 0), SIMD3<Double>(-sin(a), 0, cos(a))]) }
+func rotX(_ a: Double) -> simd_double3x3 { simd_double3x3(rows: [SIMD3<Double>(1, 0, 0), SIMD3<Double>(0, cos(a), -sin(a)), SIMD3<Double>(0, sin(a), cos(a))]) }
+func rotZ(_ a: Double) -> simd_double3x3 { simd_double3x3(rows: [SIMD3<Double>(cos(a), -sin(a), 0), SIMD3<Double>(sin(a), cos(a), 0), SIMD3<Double>(0, 0, 1)]) }
 func angle(_ a: simd_double3x3, _ b: simd_double3x3) -> Double {
     let d = a * b.transpose
     return acos(max(-1, min(1, (d[0][0] + d[1][1] + d[2][2] - 1) / 2))) * 180 / .pi
@@ -79,7 +82,7 @@ for (n, l) in layout.enumerated() {
         for u in 0..<W {
             var c = SIMD3<Double>(repeating: 0)
             for (du, dv) in [(-0.25, -0.25), (0.25, -0.25), (-0.25, 0.25), (0.25, 0.25)] {
-                let k = SIMD3((Double(u) + du - cx) / F, -(Double(v) + dv - cy) / F, -1)
+                let k = SIMD3<Double>((Double(u) + du - cx) / F, -(Double(v) + dv - cy) / F, -1)
                 c += scene(simd_normalize(R * k))
             }
             c = c / 4 * gain
@@ -98,7 +101,7 @@ for (n, l) in layout.enumerated() {
 var off = shots
 var initialError: [Double] = []
 for k in 1..<off.count {
-    var axis = SIMD3(random() - 0.5, random() - 0.5, random() - 0.5)
+    var axis = SIMD3<Double>(random() - 0.5, random() - 0.5, random() - 0.5)
     axis = simd_normalize(axis)
     let w = axis * ((0.5 + 0.7 * random()) * .pi / 180)
     off[k].matrix = PanoramaStitcher.exp(w) * truth[k]
@@ -131,9 +134,12 @@ func compare(_ img: CGImage) -> (mean: Double, bad: Double) {
         guard abs(lat) < 75 * .pi / 180 else { continue }
         for x in stride(from: 0, to: outW, by: 2) {
             let lon = (Double(x) + 0.5) / Double(outW) * 2 * .pi - .pi + yaw0
-            let s = scene(SIMD3(cos(lat) * sin(lon), sin(lat), -cos(lat) * cos(lon)))
+            let s = scene(SIMD3<Double>(cos(lat) * sin(lon), sin(lat), -cos(lat) * cos(lon)))
             let p = (y * outW + x) * 4
-            let e = (abs(Double(px[p]) - s.x) + abs(Double(px[p + 1]) - s.y) + abs(Double(px[p + 2]) - s.z)) / 3
+            let e0: Double = abs(Double(px[p]) - s.x)
+            let e1: Double = abs(Double(px[p + 1]) - s.y)
+            let e2: Double = abs(Double(px[p + 2]) - s.z)
+            let e: Double = (e0 + e1 + e2) / 3
             total += e; n += 1
             if e > 40 { bad += 1 }
         }

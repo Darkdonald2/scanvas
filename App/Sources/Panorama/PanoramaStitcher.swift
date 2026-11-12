@@ -34,9 +34,9 @@ struct PanoShot: Codable {
 
     var matrix: simd_double3x3 {
         get {
-            simd_double3x3(rows: [SIMD3(rotation[0], rotation[1], rotation[2]),
-                                  SIMD3(rotation[3], rotation[4], rotation[5]),
-                                  SIMD3(rotation[6], rotation[7], rotation[8])])
+            simd_double3x3(rows: [SIMD3<Double>(rotation[0], rotation[1], rotation[2]),
+                                  SIMD3<Double>(rotation[3], rotation[4], rotation[5]),
+                                  SIMD3<Double>(rotation[6], rotation[7], rotation[8])])
         }
         set {
             var r = [Double](repeating: 0, count: 9)
@@ -506,7 +506,7 @@ struct PanoramaStitcher {
             for k in 0..<n { A[k * n + k] += k < 3 ? 1e6 : 1e-3 }
             guard let x = solveLinear(A, g, n) else { return (result, 0) }
             for k in 0..<count {
-                var w = SIMD3(x[3 * k], x[3 * k + 1], x[3 * k + 2])
+                var w = SIMD3<Double>(x[3 * k], x[3 * k + 1], x[3 * k + 2])
                 let angle = simd_length(w)
                 let limit = 3.0 * .pi / 180                       // never more than 3° in one round
                 if angle > limit { w *= limit / angle }
@@ -534,7 +534,7 @@ struct PanoramaStitcher {
         let angle = simd_length(w)
         guard angle > 1e-12 else { return matrix_identity_double3x3 }
         let k = w / angle
-        let K = simd_double3x3(rows: [SIMD3(0, -k.z, k.y), SIMD3(k.z, 0, -k.x), SIMD3(-k.y, k.x, 0)])
+        let K = simd_double3x3(rows: [SIMD3<Double>(0, -k.z, k.y), SIMD3<Double>(k.z, 0, -k.x), SIMD3<Double>(-k.y, k.x, 0)])
         return matrix_identity_double3x3 + sin(angle) * K + (1 - cos(angle)) * (K * K)
     }
 
@@ -587,7 +587,7 @@ struct PanoramaStitcher {
             let lat = Double.pi / 2 - (Double(y) + 0.5) / Double(H) * .pi
             for x in 0..<W {
                 let lon = (Double(x) + 0.5) / Double(W) * 2 * .pi - .pi
-                let d = SIMD3(cos(lat) * sin(lon), sin(lat), -cos(lat) * cos(lon))
+                let d = SIMD3<Double>(cos(lat) * sin(lon), sin(lat), -cos(lat) * cos(lon))
                 var seen: [(Int, SIMD3<Double>)] = []
                 for (k, s) in sources.enumerated() {
                     guard simd_dot(d, s.centre) > cos(s.radius) else { continue }
@@ -603,7 +603,7 @@ struct PanoramaStitcher {
             }
         }
         let sigmaN = 10.0, sigmaG = 0.1
-        var gains = [SIMD3<Float>](repeating: SIMD3(1, 1, 1), count: n)
+        var gains = [SIMD3<Float>](repeating: SIMD3<Double>(1, 1, 1), count: n)
         for ch in 0..<3 {
             var A = [Double](repeating: 0, count: n * n)
             var b = [Double](repeating: 0, count: n)
@@ -636,7 +636,7 @@ struct PanoramaStitcher {
         let mx = Double(s.w) * edge, my = Double(s.h) * edge
         guard x >= mx, y >= my, x < Double(s.w - 1) - mx, y < Double(s.h - 1) - my else { return nil }
         let p = s.rgba + (Int(y) * s.w + Int(x)) * 4
-        return SIMD3(Double(p[0]), Double(p[1]), Double(p[2]))
+        return SIMD3<Double>(Double(p[0]), Double(p[1]), Double(p[2]))
     }
 
     // MARK: - Painting
@@ -658,16 +658,6 @@ struct PanoramaStitcher {
             let lat = Double.pi / 2 - (Double(y) + 0.5) / Double(H) * .pi
             sinLat[y] = Float(sin(lat)); cosLat[y] = Float(cos(lat))
         }
-        struct Cam {
-            var rt: simd_float3x3
-            var fx: Float, fy: Float, cx: Float, cy: Float
-            var hw: Float, hh: Float
-            var w: Int, h: Int
-            var gain: SIMD3<Float>
-            var rgba: UnsafeMutablePointer<UInt8>
-            var centre: SIMD3<Double>
-            var radius: Double
-        }
         let cams: [Cam] = sources.map { s in
             let rt = s.rotation.transpose
             func f3(_ v: SIMD3<Double>) -> SIMD3<Float> { SIMD3<Float>(Float(v.x), Float(v.y), Float(v.z)) }
@@ -676,62 +666,15 @@ struct PanoramaStitcher {
                        hw: Float(s.w - 1) / 2, hh: Float(s.h - 1) / 2, w: s.w, h: s.h, gain: s.gain,
                        rgba: s.rgba, centre: s.centre, radius: s.radius)
         }
-        let tileRadius = 0.5 * sqrt(pow(Double(tile) / Double(W) * 2 * .pi, 2) + pow(Double(tile) / Double(H) * .pi, 2))
+        let grid = Grid(width: W, height: H, tile: tile, yaw0: yaw0, power: power,
+                        sinLon: sinLon, cosLon: cosLon, sinLat: sinLat, cosLat: cosLat)
         let lock = NSLock()
         var done = 0
         var covered = 0
         DispatchQueue.concurrentPerform(iterations: tilesY) { ty in
             var seen = 0
             for tx in 0..<tilesX {
-                let x0 = tx * tile, y0 = ty * tile
-                let x1 = min(W, x0 + tile), y1 = min(H, y0 + tile)
-                let lonC = (Double(x0 + x1) / 2) / Double(W) * 2 * .pi - .pi + yaw0
-                let latC = Double.pi / 2 - (Double(y0 + y1) / 2) / Double(H) * .pi
-                let dc = SIMD3(cos(latC) * sin(lonC), sin(latC), -cos(latC) * cos(lonC))
-                let near = cams.filter { cam in
-                    acos(max(-1, min(1, simd_dot(dc, cam.centre)))) <= cam.radius + tileRadius
-                }
-                for y in y0..<y1 {
-                    let cl = cosLat[y], sl = sinLat[y]
-                    for x in x0..<x1 {
-                        let d = SIMD3<Float>(cl * sinLon[x], sl, -cl * cosLon[x])
-                        var acc = SIMD3<Float>(repeating: 0)
-                        var wsum: Float = 0
-                        for cam in near {
-                            let c = cam.rt * d
-                            let z = -c.z
-                            guard z > 1e-6 else { continue }
-                            let u = cam.cx + cam.fx * c.x / z
-                            let v = cam.cy - cam.fy * c.y / z
-                            guard u >= 0, v >= 0, u < Float(cam.w - 1), v < Float(cam.h - 1) else { continue }
-                            let nx = (u - cam.hw) / cam.hw, ny = (v - cam.hh) / cam.hh
-                            var t = (1 - nx * nx) * (1 - ny * ny)
-                            guard t > 0 else { continue }
-                            var wgt: Float = 1
-                            for _ in 0..<power { wgt *= t }
-                            t = wgt
-                            let ix = Int(u), iy = Int(v)
-                            let fx = u - Float(ix), fy = v - Float(iy)
-                            let p = cam.rgba + (iy * cam.w + ix) * 4
-                            let q = p + cam.w * 4
-                            let c00 = SIMD3<Float>(Float(p[0]), Float(p[1]), Float(p[2]))
-                            let c10 = SIMD3<Float>(Float(p[4]), Float(p[5]), Float(p[6]))
-                            let c01 = SIMD3<Float>(Float(q[0]), Float(q[1]), Float(q[2]))
-                            let c11 = SIMD3<Float>(Float(q[4]), Float(q[5]), Float(q[6]))
-                            let col = (c00 * (1 - fx) + c10 * fx) * (1 - fy) + (c01 * (1 - fx) + c11 * fx) * fy
-                            acc += col * cam.gain * t
-                            wsum += t
-                        }
-                        let o = pixels + (y * W + x) * 4
-                        if wsum > 0 {
-                            let c = simd_clamp(acc / wsum, SIMD3<Float>(repeating: 0), SIMD3<Float>(repeating: 255))
-                            o[0] = UInt8(c.x.rounded()); o[1] = UInt8(c.y.rounded()); o[2] = UInt8(c.z.rounded()); o[3] = 255
-                            seen += 1
-                        } else {
-                            o[0] = 0; o[1] = 0; o[2] = 0; o[3] = 0
-                        }
-                    }
-                }
+                seen += paintTile(tx: tx, ty: ty, grid: grid, cams: cams, pixels: pixels)
             }
             lock.lock()
             covered += seen
@@ -740,6 +683,92 @@ struct PanoramaStitcher {
             lock.unlock()
         }
         return covered
+    }
+
+    private struct Cam {
+        var rt: simd_float3x3
+        var fx: Float, fy: Float, cx: Float, cy: Float
+        var hw: Float, hh: Float
+        var w: Int, h: Int
+        var gain: SIMD3<Float>
+        var rgba: UnsafeMutablePointer<UInt8>
+        var centre: SIMD3<Double>
+        var radius: Double
+    }
+
+    private struct Grid {
+        var width: Int, height: Int, tile: Int
+        var yaw0: Double
+        var power: Int
+        var sinLon: [Float], cosLon: [Float], sinLat: [Float], cosLat: [Float]
+    }
+
+    /// Paints one tile of the panorama; returns how many of its pixels some photo saw.
+    private static func paintTile(tx: Int, ty: Int, grid: Grid, cams: [Cam], pixels: UnsafeMutablePointer<UInt8>) -> Int {
+        let W = grid.width, H = grid.height, tile = grid.tile
+        let x0 = tx * tile, y0 = ty * tile
+        let x1 = min(W, x0 + tile), y1 = min(H, y0 + tile)
+        let lonC: Double = (Double(x0 + x1) / 2) / Double(W) * 2 * Double.pi - Double.pi + grid.yaw0
+        let latC: Double = Double.pi / 2 - (Double(y0 + y1) / 2) / Double(H) * Double.pi
+        let dc = SIMD3<Double>(cos(latC) * sin(lonC), sin(latC), -cos(latC) * cos(lonC))
+        let spanLon: Double = Double(tile) / Double(W) * 2 * Double.pi
+        let spanLat: Double = Double(tile) / Double(H) * Double.pi
+        let tileRadius: Double = 0.5 * (spanLon * spanLon + spanLat * spanLat).squareRoot()
+        let near = cams.filter { cam in
+            acos(max(-1, min(1, simd_dot(dc, cam.centre)))) <= cam.radius + tileRadius
+        }
+        var seen = 0
+        for y in y0..<y1 {
+            let cl = grid.cosLat[y], sl = grid.sinLat[y]
+            for x in x0..<x1 {
+                let d = SIMD3<Float>(cl * grid.sinLon[x], sl, -cl * grid.cosLon[x])
+                var acc = SIMD3<Float>(repeating: 0)
+                var wsum: Float = 0
+                for cam in near {
+                    if let (colour, weight) = sample(cam, d, power: grid.power) {
+                        acc += colour * weight
+                        wsum += weight
+                    }
+                }
+                let o = pixels + (y * W + x) * 4
+                if wsum > 0 {
+                    let c = acc / wsum
+                    o[0] = byte(c.x); o[1] = byte(c.y); o[2] = byte(c.z); o[3] = 255
+                    seen += 1
+                } else {
+                    o[0] = 0; o[1] = 0; o[2] = 0; o[3] = 0
+                }
+            }
+        }
+        return seen
+    }
+
+    @inline(__always) private static func byte(_ v: Float) -> UInt8 { UInt8(max(0, min(255, v)).rounded()) }
+
+    /// Colour (with the photo's gain) and blend weight of one photo in direction d, or nil if it doesn't see it.
+    @inline(__always) private static func sample(_ cam: Cam, _ d: SIMD3<Float>, power: Int) -> (SIMD3<Float>, Float)? {
+        let c = cam.rt * d
+        let z = -c.z
+        guard z > 1e-6 else { return nil }
+        let u: Float = cam.cx + cam.fx * c.x / z
+        let v: Float = cam.cy - cam.fy * c.y / z
+        guard u >= 0, v >= 0, u < Float(cam.w - 1), v < Float(cam.h - 1) else { return nil }
+        let nx: Float = (u - cam.hw) / cam.hw
+        let ny: Float = (v - cam.hh) / cam.hh
+        let t: Float = (1 - nx * nx) * (1 - ny * ny)
+        guard t > 0 else { return nil }
+        var weight: Float = 1
+        for _ in 0..<power { weight *= t }
+        let ix = Int(u), iy = Int(v)
+        let fx: Float = u - Float(ix), fy: Float = v - Float(iy)
+        let p = cam.rgba + (iy * cam.w + ix) * 4
+        let q = p + cam.w * 4
+        let w00: Float = (1 - fx) * (1 - fy), w10: Float = fx * (1 - fy)
+        let w01: Float = (1 - fx) * fy, w11: Float = fx * fy
+        let r: Float = Float(p[0]) * w00 + Float(p[4]) * w10 + Float(q[0]) * w01 + Float(q[4]) * w11
+        let g: Float = Float(p[1]) * w00 + Float(p[5]) * w10 + Float(q[1]) * w01 + Float(q[5]) * w11
+        let b: Float = Float(p[2]) * w00 + Float(p[6]) * w10 + Float(q[2]) * w01 + Float(q[6]) * w11
+        return (SIMD3<Float>(r, g, b) * cam.gain, weight)
     }
 
     /// Gives every unseen pixel the colour of the nearest seen area: averaged at low resolution, spread outward
@@ -755,7 +784,7 @@ struct PanoramaStitcher {
                 let p = pixels + (y * W + x) * 4
                 guard p[3] > 0 else { continue }
                 let k = (y / cell) * lw + x / cell
-                colour[k] += SIMD3(Float(p[0]), Float(p[1]), Float(p[2]))
+                colour[k] += SIMD3<Float>(Float(p[0]), Float(p[1]), Float(p[2]))
                 weight[k] += 1
             }
         }
@@ -806,9 +835,10 @@ struct PanoramaStitcher {
                 guard p[3] == 0 else { continue }
                 let fx = max(0, min(Float(lw - 1), (Float(x) + 0.5) / Float(cell) - 0.5))
                 let x0 = Int(fx), x1 = min(lw - 1, x0 + 1), tx = fx - Float(x0)
-                let c = (filled[y0 * lw + x0] * (1 - tx) + filled[y0 * lw + x1] * tx) * (1 - ty)
-                      + (filled[y1 * lw + x0] * (1 - tx) + filled[y1 * lw + x1] * tx) * ty
-                p[0] = UInt8(max(0, min(255, c.x))); p[1] = UInt8(max(0, min(255, c.y))); p[2] = UInt8(max(0, min(255, c.z)))
+                let top: SIMD3<Float> = filled[y0 * lw + x0] * (1 - tx) + filled[y0 * lw + x1] * tx
+                let bottom: SIMD3<Float> = filled[y1 * lw + x0] * (1 - tx) + filled[y1 * lw + x1] * tx
+                let c: SIMD3<Float> = top * (1 - ty) + bottom * ty
+                p[0] = byte(c.x); p[1] = byte(c.y); p[2] = byte(c.z)
                 p[3] = 255
             }
         }
