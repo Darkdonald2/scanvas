@@ -26,7 +26,25 @@ final class PanoramaCaptureModel: NSObject, ObservableObject, ARSessionDelegate 
         return t
     }
 
+    /// A lighter set for tours: 12 at the horizon and 4 each looking up and down (20 photos). Still covers
+    /// the whole sphere, with less overlap.
+    static func quickLayout() -> [Target] {
+        var t: [Target] = []
+        for k in 0..<12 { t.append(Target(yaw: Double(k) * 30, pitch: 0)) }
+        for k in 0..<4 { t.append(Target(yaw: Double(k) * 90 + 45, pitch: 55)) }
+        for k in 0..<4 { t.append(Target(yaw: Double(k) * 90 + 45, pitch: -55)) }
+        return t
+    }
+
     @Published private(set) var targets = PanoramaCaptureModel.layout()
+    /// False between the stops of a tour: the camera keeps tracking, but no dots are shown and nothing is taken.
+    @Published private(set) var capturing = true
+    @Published private(set) var tracking = false
+    /// Where the camera is now (ARKit world), for the tour's map.
+    @Published private(set) var cameraPosition = SIMD3<Float>(0, 0, 0)
+    @Published private(set) var cameraHeading: Double = 0
+    private var positionSum = SIMD3<Float>(0, 0, 0)
+    private var lastPublished: TimeInterval = 0
     @Published private(set) var shotsTaken = 0
     @Published private(set) var hold: Double = 0             // 0…1 while lined up and still
     @Published private(set) var arrow: Double?               // radians clockwise from up, toward the next dot
@@ -36,7 +54,7 @@ final class PanoramaCaptureModel: NSObject, ObservableObject, ARSessionDelegate 
     @Published var errorMessage: String?
 
     let arView = ARView(frame: .zero, cameraMode: .ar, automaticallyConfigureSession: false)
-    let folder: URL
+    private(set) var folder: URL
 
     private var origin: SIMD3<Float>?
     private var yaw0: Double = 0
@@ -60,6 +78,64 @@ final class PanoramaCaptureModel: NSObject, ObservableObject, ARSessionDelegate 
         super.init()
     }
 
+    // MARK: Tours: several stops in one tracked session
+
+    /// Starts tracking without capturing anything yet (the user walks to the first spot).
+    func startIdle() {
+        capturing = false
+        runSession()
+    }
+
+    /// Starts a new 360 at the spot where the phone is now.
+    func beginStop(folder: URL, targets: [Target]) {
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        self.folder = folder
+        removeDots()
+        self.targets = targets
+        shots = []
+        shotsTaken = 0
+        positionSum = .zero
+        origin = nil
+        highlighted = -1
+        alignedSince = nil
+        hold = 0
+        arrow = nil
+        started = false
+        moved = false
+        setExposureLock(false)
+        capturing = true
+    }
+
+    /// Ends the current stop. Returns where it was taken (the average camera position of its photos) and an
+    /// anchor ARKit will keep correcting, or nil if no photo was saved.
+    func endStop() -> (position: SIMD3<Float>, anchor: UUID)? {
+        capturing = false
+        removeDots()
+        setExposureLock(false)
+        hold = 0
+        arrow = nil
+        guard !shots.isEmpty else { return nil }
+        let p = positionSum / Float(shots.count)
+        var t = matrix_identity_float4x4
+        t.columns.3 = SIMD4(p.x, p.y, p.z, 1)
+        let a = ARAnchor(name: "scanvas-stop", transform: t)
+        arView.session.add(anchor: a)
+        return (p, a.identifier)
+    }
+
+    /// Where ARKit now places the anchors left at the stops (it moves them when it corrects its map).
+    func anchorTransforms() -> [UUID: simd_float4x4] {
+        var out: [UUID: simd_float4x4] = [:]
+        for a in arView.session.currentFrame?.anchors ?? [] where a.name == "scanvas-stop" { out[a.identifier] = a.transform }
+        return out
+    }
+
+    private func removeDots() {
+        if let anchor { arView.scene.removeAnchor(anchor) }
+        anchor = nil
+        dots = []
+    }
+
     var allDone: Bool { !targets.contains { !$0.done } }
 
     func start() {
@@ -69,6 +145,10 @@ final class PanoramaCaptureModel: NSObject, ObservableObject, ARSessionDelegate 
             errorMessage = "Couldn't make a folder for the photos: \(error.localizedDescription)"
             return
         }
+        runSession()
+    }
+
+    private func runSession() {
         let config = ARWorldTrackingConfiguration()
         if let format = ARWorldTrackingConfiguration.recommendedVideoFormatForHighResolutionFrameCapturing {
             config.videoFormat = format
@@ -116,11 +196,23 @@ final class PanoramaCaptureModel: NSObject, ObservableObject, ARSessionDelegate 
         guard case .normal = frame.camera.trackingState else {
             alignedSince = nil
             if hold != 0 { hold = 0 }
+            if tracking { tracking = false }
             return
         }
+        if !tracking { tracking = true }
         let t = frame.camera.transform
         let position = SIMD3(t.columns.3.x, t.columns.3.y, t.columns.3.z)
         let forward = -SIMD3(t.columns.2.x, t.columns.2.y, t.columns.2.z)
+        if now - lastPublished > 0.2 {
+            lastPublished = now
+            cameraPosition = position
+            cameraHeading = atan2(Double(forward.x), Double(-forward.z))
+        }
+        guard capturing else {
+            lastForward = forward
+            lastTime = now
+            return
+        }
         if origin == nil {
             origin = position
             yaw0 = atan2(Double(forward.x), Double(-forward.z))
@@ -219,9 +311,11 @@ final class PanoramaCaptureModel: NSObject, ObservableObject, ARSessionDelegate 
                             rotation: [Double](repeating: 0, count: 9))
         shot.matrix = r
 
+        guard capturing, targets.indices.contains(index) else { busy = false; return }
         targets[index].done = true
         paint(index)
         shotsTaken += 1
+        positionSum += SIMD3(t.columns.3.x, t.columns.3.y, t.columns.3.z)
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         // The first photo sets the exposure; the rest use the same, so their brightness matches.
         if !exposureLocked { setExposureLock(true) }
@@ -239,6 +333,8 @@ final class PanoramaCaptureModel: NSObject, ObservableObject, ARSessionDelegate 
             }
             DispatchQueue.main.async {
                 self.busy = false
+                // The stop this photo belongs to may have ended meanwhile.
+                guard url.deletingLastPathComponent().standardizedFileURL.path == self.folder.standardizedFileURL.path else { return }
                 guard ok else {
                     self.targets[index].done = false
                     self.shotsTaken -= 1
@@ -279,7 +375,36 @@ final class PanoramaCaptureModel: NSObject, ObservableObject, ARSessionDelegate 
     }
 }
 
-private struct PanoARContainer: UIViewRepresentable {
+/// The on-screen guidance shared by the 360 photo and tour capture screens.
+enum PanoGuide {
+    static func message(_ model: PanoramaCaptureModel) -> String {
+        if !model.started { return "Hold the phone upright and move it a little to start" }
+        if model.moved { return "Stay in one spot: turn the phone, don't walk" }
+        if model.tooFast { return "Turn more slowly" }
+        if model.allDone { return "All done" }
+        if model.arrow != nil { return "Turn toward the yellow dot" }
+        if model.shotsTaken == 0 { return "Put the yellow dot in the circle and hold still" }
+        return "Next dot. Turn around your phone, not your body, for the best result"
+    }
+
+    struct Reticle: View {
+        @ObservedObject var model: PanoramaCaptureModel
+        var body: some View {
+            ZStack {
+                Circle().stroke(.white.opacity(0.9), lineWidth: 3).frame(width: 64, height: 64)
+                Circle().trim(from: 0, to: model.hold).stroke(.green, style: StrokeStyle(lineWidth: 6, lineCap: .round))
+                    .rotationEffect(.degrees(-90)).frame(width: 64, height: 64)
+                if let a = model.arrow {
+                    Image(systemName: "arrow.up").font(.system(size: 34, weight: .bold)).foregroundStyle(.yellow)
+                        .offset(y: -78).rotationEffect(.radians(a))
+                }
+            }
+            .allowsHitTesting(false)
+        }
+    }
+}
+
+struct PanoARContainer: UIViewRepresentable {
     let arView: ARView
     func makeUIView(context: Context) -> ARView { arView }
     func updateUIView(_ uiView: ARView, context: Context) {}
@@ -352,29 +477,8 @@ struct PanoramaCaptureView: View {
     }
 
     private var warning: Bool { model.moved || model.tooFast }
-
-    private var message: String {
-        if !model.started { return "Hold the phone upright and move it a little to start" }
-        if model.moved { return "Stay in one spot: turn the phone, don't walk" }
-        if model.tooFast { return "Turn more slowly" }
-        if model.allDone { return "All done" }
-        if model.arrow != nil { return "Turn toward the yellow dot" }
-        if model.shotsTaken == 0 { return "Put the yellow dot in the circle and hold still" }
-        return "Next dot. Turn around your phone, not your body, for the best result"
-    }
-
-    private var reticle: some View {
-        ZStack {
-            Circle().stroke(.white.opacity(0.9), lineWidth: 3).frame(width: 64, height: 64)
-            Circle().trim(from: 0, to: model.hold).stroke(.green, style: StrokeStyle(lineWidth: 6, lineCap: .round))
-                .rotationEffect(.degrees(-90)).frame(width: 64, height: 64)
-            if let a = model.arrow {
-                Image(systemName: "arrow.up").font(.system(size: 34, weight: .bold)).foregroundStyle(.yellow)
-                    .offset(y: -78).rotationEffect(.radians(a))
-            }
-        }
-        .allowsHitTesting(false)
-    }
+    private var message: String { PanoGuide.message(model) }
+    private var reticle: some View { PanoGuide.Reticle(model: model) }
 
     private func finish() {
         guard !building, model.shotsTaken >= 4 else { return }
@@ -409,8 +513,8 @@ struct PanoramaCaptureView: View {
     }
 }
 
-/// Stitches a capture's photos into panorama.jpg plus a thumbnail and a report. Used after capture and by
-/// "Stitch again" on the panorama's page.
+/// Stitches a capture's photos into a panorama file. Used after capture, by "Stitch again", and for every
+/// stop of a tour.
 enum PanoramaBuilder {
     static let listName = "shots.json"
 
@@ -419,30 +523,44 @@ enum PanoramaBuilder {
         var report: PanoramaStitcher.Report
     }
 
+    /// Output width for single 360 photos: 8192 needs about 1 GB while stitching; phones with less memory get 6144.
+    static var fullWidth: Int { ProcessInfo.processInfo.physicalMemory >= 6 << 30 ? 8192 : 6144 }
+    /// Tours hold many panoramas and switch between them, so each is a little smaller.
+    static var tourWidth: Int { ProcessInfo.processInfo.physicalMemory >= 6 << 30 ? 6144 : 4096 }
+
+    /// A single 360 photo: PanoShots → panorama.jpg, thumbnail and report in the project folder.
     static func build(folder: URL, refine: Bool = true, progress: @escaping (Double, String) -> Void) async throws -> Result {
         try await Task.detached(priority: .userInitiated) {
-            let shotsFolder = folder.appendingPathComponent(ProjectFile.panoShots, isDirectory: true)
-            let data = try Data(contentsOf: shotsFolder.appendingPathComponent(listName))
-            let capture = try JSONDecoder().decode(PanoCapture.self, from: data)
-            var options = PanoramaStitcher.Options()
-            // 8192 wide needs about 1 GB while stitching; phones with less memory get 6144.
-            options.width = ProcessInfo.processInfo.physicalMemory >= 6 << 30 ? 8192 : 6144
-            options.refine = refine
             ProcessingMonitor.begin()
-            ProcessingMonitor.stage("360 photo: stitching \(capture.shots.count) photos")
             defer { ProcessingMonitor.end() }
-            let out = try PanoramaStitcher.stitch(folder: shotsFolder, shots: capture.shots, options: options, progress: progress)
-            progress(0.98, "Saving")
-            try PanoramaStitcher.writeJPEG(out.image, to: folder.appendingPathComponent(ProjectFile.panorama))
-            writeThumbnail(out.image, to: folder.appendingPathComponent(ProjectFile.thumbnail))
-            let text = "360 photo, stitched \(Date().formatted())\n\(out.report.summary)\n"
+            let (image, result) = try stitch(shots: folder.appendingPathComponent(ProjectFile.panoShots, isDirectory: true),
+                                             to: folder.appendingPathComponent(ProjectFile.panorama),
+                                             width: fullWidth, centreYaw: nil, refine: refine, progress: progress)
+            writeThumbnail(image, to: folder.appendingPathComponent(ProjectFile.thumbnail))
+            let text = "360 photo, stitched \(Date().formatted())\n\(result.report.summary)\n"
             try? text.write(to: folder.appendingPathComponent("processing.txt"), atomically: true, encoding: .utf8)
-            return Result(width: options.width, report: out.report)
+            return result
         }.value
     }
 
+    /// Stitches the photos in `shots` (with their shots.json) and writes the panorama to `file`.
+    static func stitch(shots: URL, to file: URL, width: Int, centreYaw: Double?, refine: Bool,
+                       progress: @escaping (Double, String) -> Void) throws -> (CGImage, Result) {
+        let data = try Data(contentsOf: shots.appendingPathComponent(listName))
+        let capture = try JSONDecoder().decode(PanoCapture.self, from: data)
+        var options = PanoramaStitcher.Options()
+        options.width = width
+        options.refine = refine
+        options.centreYaw = centreYaw
+        ProcessingMonitor.stage("360: stitching \(capture.shots.count) photos")
+        let out = try PanoramaStitcher.stitch(folder: shots, shots: capture.shots, options: options, progress: progress)
+        progress(0.98, "Saving")
+        try PanoramaStitcher.writeJPEG(out.image, to: file)
+        return (out.image, Result(width: width, report: out.report))
+    }
+
     /// The middle of the panorama (90° each way), small.
-    private static func writeThumbnail(_ image: CGImage, to url: URL) {
+    static func writeThumbnail(_ image: CGImage, to url: URL) {
         let w = image.width, h = image.height
         guard let crop = image.cropping(to: CGRect(x: w * 3 / 8, y: h / 4, width: w / 4, height: h / 2)) else { return }
         let size = 400

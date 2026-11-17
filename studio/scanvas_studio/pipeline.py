@@ -595,6 +595,12 @@ def process(capture: Capture, out: Path, s: Settings, report: Report) -> dict:
                 budget //= 2
                 report(f"Texturing: trying again with {budget:,} triangles", 0.64)
     files = export(out, mesh, textured, s, report)
+    # Where every photo ended up after alignment, so a result can be checked or re-textured later without
+    # running everything again.
+    cams = {"note": "cameraToWorld per photo index after alignment, 4x4 row-major, ARKit axes (before any Z-up turn)",
+            "cameraToWorld": {str(f.index): [float(x) for x in f.camera_to_world.reshape(-1)] for f in frames}}
+    (out / "cameras.json").write_text(json.dumps(cams))
+    files.append(out / "cameras.json")
     log["files"] = [f.name for f in files]
     log["minutes"] = round((time.time() - start) / 60, 1)
     (out / "processing.json").write_text(json.dumps(log, indent=2))

@@ -4,7 +4,7 @@ import RealityKit
 import ARKit
 
 enum CaptureMode: String, Identifiable {
-    case room, space, object, photos, measure, pipes, panorama
+    case room, space, object, photos, measure, pipes, panorama, tour
     var id: String { rawValue }
 }
 
@@ -45,6 +45,7 @@ struct HomeView: View {
                 switch p.kind {
                 case .pipe: PipeDetailView(project: p)
                 case .panorama: PanoramaDetailView(project: p)
+                case .tour: TourDetailView(project: p)
                 default: ProjectDetailView(project: p)
                 }
             }
@@ -65,6 +66,7 @@ struct HomeView: View {
                 case .measure: MeasureView()
                 case .pipes: PipeSurveyView(onSaved: open)
                 case .panorama: PanoramaCaptureView(project: ScanProject(name: store.nextName(for: .panorama), kind: .panorama), onSaved: open)
+                case .tour: TourCaptureView(project: ScanProject(name: store.nextName(for: .tour), kind: .tour), onSaved: open)
                 }
             }
             .environmentObject(store)
@@ -108,8 +110,13 @@ struct HomeView: View {
                     start(.measure, supported: true, reason: "")
                 }
             }
-            ModeTile(title: "360 Photo", subtitle: "Guided photos all around you, stitched into a 360° panorama", icon: "pano", color: .yellow, wide: true) {
-                start(.panorama, supported: ARWorldTrackingConfiguration.isSupported, reason: "360 photos need ARKit, which this device doesn't support.")
+            HStack(spacing: 12) {
+                ModeTile(title: "360 Photo", subtitle: "Guided photos stitched into a 360° panorama", icon: "pano", color: .yellow) {
+                    start(.panorama, supported: ARWorldTrackingConfiguration.isSupported, reason: "360 photos need ARKit, which this device doesn't support.")
+                }
+                ModeTile(title: "Tour", subtitle: "Linked 360s you can walk through, room to room", icon: "figure.walk", color: .mint) {
+                    start(.tour, supported: ARWorldTrackingConfiguration.isSupported, reason: "Tours need ARKit, which this device doesn't support.")
+                }
             }
         }
     }
