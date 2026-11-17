@@ -391,6 +391,10 @@ final class MeshScanner: NSObject, ObservableObject, ARSessionDelegate {
             guard let id = best?.0, let then = kf.anchorTransforms[id], let current = now[id] else { return kf }
             let correction = current * then.inverse
             let corrected = correction * camera
+            // ARKit sometimes re-creates a mesh anchor somewhere else, which looks like a jump of a metre or
+            // more and has nothing to do with drift (seen on a real scan). Real corrections are far smaller.
+            let shift = simd_distance(SIMD3(corrected.columns.3.x, corrected.columns.3.y, corrected.columns.3.z), kf.cameraPosition)
+            guard shift < 0.3 else { kf.anchorTransforms = [:]; return kf }
             kf.worldToCamera = corrected.inverse
             kf.cameraPosition = SIMD3(corrected.columns.3.x, corrected.columns.3.y, corrected.columns.3.z)
             kf.anchorTransforms = [:]
