@@ -128,20 +128,24 @@ Coordinates are ARKit's: Y up, metres, with the camera looking along −Z.
    resolution.
 4. **Refine cameras:** point-to-plane ICP of each frame's high-confidence depth against a first-pass mesh, then
    fuse again. One pass helps; a second pass made it worse in tests.
-5. **Clean:** remove clusters below max(0.02 m², 0.05 % of the area), then Taubin smoothing.
+5. **Clean:** remove clusters below max(0.05 m², 0.2 % of the area), then Taubin smoothing.
 6. **Texture** (`texturing.py`; this replaces Open3D's own `project_images_to_albedo`, which bled colour through
    objects):
-   - decimate to 200k / 600k / 1.2M triangles, then `make_manifold`, then UVAtlas;
-   - score each triangle against each photo, keeping the top 8. A photo only counts if nothing in the model is
+   - decimate to 200k / 600k / 1.2M triangles, split into 1–6 parts of equal area (one texture page each,
+     about 1 mm per texel), then `make_manifold` and UVAtlas per part;
+   - score each triangle against each photo, keeping the top 24. A photo only counts if nothing in the model is
      nearer within a few pixels (a depth picture of the model per photo) and the photo's own LiDAR depth agrees
      with the model there;
-   - join patches with neighbours;
+   - remove patches that several photos' LiDAR looked straight through (people walking by);
+   - choose photos: as few as possible first, then a pass that weighs each photo's score against how many
+     neighbours use the same photo;
    - per-photo brightness gains, then a smooth per-patch correction toward the colour the photos agree on;
    - rasterise texel→triangle ids with PIL, then sample every texel from its photo at full resolution;
    - fill the gaps between patches so no dark lines show at a distance;
    - on failure, retry with half the triangles (twice) before falling back to the coloured mesh only.
-7. **Export:** `model_textured.obj/.mtl/.jpg`, `model_textured.glb` (unlit, texture embedded),
-   `model_dense_colour.ply` and `point_cloud.ply`. Choosing Z up adds `phone_model.glb` in Y up. `processing.json`
+7. **Export:** `model_textured.obj/.mtl`, `model_textured.jpg` (or `model_textured_0..N.jpg` with several
+   pages), `model_textured.glb` (unlit, textures embedded, one mesh part per page), `cameras.json` (aligned
+   camera positions), `model_dense_colour.ply` and `point_cloud.ply`. Choosing Z up adds `phone_model.glb` in Y up. `processing.json`
    records the run.
 
 On the synthetic room at High: about 2.5 minutes, about 3 GB peak memory, mean surface error about 7 mm. On the
@@ -183,6 +187,42 @@ to `main` trigger the builds. Studio-only changes don't rebuild the ipa.
 
 ## 8. Recent fixes (newest first)
 
+- **Tour mode** (17 November 2026). `Panorama/Tour.swift`. A tour is several 360s ("stops") captured in one
+  ARKit session, so every stop has a position in the same world. Capture (`TourCaptureView`) reuses
+  `PanoramaCaptureModel`, which can now run several stops in one session (`startIdle`, `beginStop`, `endStop`);
+  between stops only tracking runs. Each stop's photos go to `Stops/NN/` with their own `shots.json`; the
+  stop list is `tour.json` (`Tour`, `TourStop`: id, position, rotation, anchor, photos, stitched). An
+  `ARAnchor` is left at each stop and read again at Finish, so corrections ARKit made to its map move the
+  stops too (`rotation` is the anchor's turn about the vertical). Stops are stitched at the end
+  (`TourBuilder.stitchAll`) with `centreYaw: 0`, so the middle of every panorama faces ARKit's -z and the
+  viewer needs no per-stop heading. "Quick" stops use 20 photos (`quickLayout`), "Best" the usual 30. The
+  project is saved as soon as capture starts, so finished stops survive a crash and can be stitched from the
+  tour's page. Viewing: `TourNavigator` + `PanoSceneController`. Links between stops (`Tour.links`) are the
+  stops before and after in capture order plus the nearest three within 5 m on the same level; there is no
+  knowledge of walls. Floor arrows and discs are SceneKit nodes placed with an assumed eye height of 1.45 m.
+  Compiles; nothing has run on a phone yet.
+- **Joystick and shared 360 viewer** (same date). `PanoSceneController` (in `PanoramaViewer.swift`) replaces
+  the old `PanoramaViewer`: two nested spheres for cross-fades, drag/pinch, CoreMotion, an on-screen
+  `JoystickView`. In a single 360 the stick turns and zooms; in a tour, forward and back step to the stop
+  lying that way (within 55° of the view direction).
+- **Phone Space processing** (same date). `CameraRefiner` was rewritten: the old one accepted corrections
+  under 5 cm only, but early photos of a real scan were 10–25 cm from where the mesh says. It now searches
+  from 50 cm down to 3 cm on three grids, retries poor fits from their neighbours' corrections, and returns
+  which photos to leave out of texturing. `studio/tests/phone_refiner_prototype.py` is the same algorithm in
+  Python; on Space 3 it took the share of depth points on the mesh from 20–80 % to 80–97 % for the affected
+  photos. `MeshScanner.correctedKeyframes` ignores mesh-anchor jumps over 30 cm. `Texturer`: 5×5 occlusion
+  margin, and a per-patch gain toward the colour all photos agree on. None of this has run on a phone.
+- **Studio quality pass** (same date), measured on Space 3 with `studio/tests/evaluate_real.py` (renders the
+  result from the photos' positions and compares with the photos and the LiDAR; needs `cameras.json`, which
+  Studio now saves). Changes: several texture pages (`Settings.pages_for`, about 1 mm per texel, up to 4 at
+  High; `unwrap` splits the mesh with `split_pages` and unwraps each part; OBJ/GLB/`StudioImport`/
+  `check_glb.py` handle several pages); 24 candidate photos per triangle and a fewest-photos pass plus a
+  seam-weighted pass in `choose_photos` (seam edges 200k → about 100k); patches that several photos' LiDAR
+  looked straight through are removed (`transient`); loose pieces under max(0.05 m², 0.2 %) are removed.
+  Result on Space 3: difference from the photos 23.2 → 21.7, surface in front of the LiDAR 5.4 % → 4.4 %.
+  Tried and dropped: a second camera-refinement pass (no gain: the ±6.5 mm per-photo depth offset is the
+  LiDAR's own, not pose error), stricter fusion (confidence 2, weight 3: more holes, little gain), and
+  `fill_holes` (it filled almost nothing and crashed on Windows/Open3D 0.20).
 - **360 photo mode** (12 November 2026). `Panorama/PanoramaCapture.swift`: ARKit world tracking, 30 target
   dots (12 at 0°, 8 at ±45°, zenith, nadir) drawn as RealityKit spheres 1.5 m out; lining up within 2.5° and
   holding still for 0.4 s takes a `captureHighResolutionFrame`, saved as JPEG in `PanoShots/` with its
@@ -258,10 +298,13 @@ to `main` trigger the builds. Studio-only changes don't rebuild the ipa.
 - People who move during a scan still end up as rough shapes in the mesh. Their colour no longer leaks onto
   the walls, but removing them from the geometry (masking with ARKit person segmentation at capture, or
   dropping depth that disagrees with later frames) is not done yet.
-- Studio does not save its refined camera positions, so a texture can't be re-baked later without re-running
-  the whole pipeline. Saving them in the results folder would make that possible.
-- Phone viewer: a phone-textured scan has up to ten 4096² pages, which is about 700 MB+ of GPU memory. It could
-  crash the 3D viewer on long scans; consider downsampled textures for viewing.
+- Texture seams: where two photos meet, lines can still break by up to about a centimetre. Fewer seams
+  helped; removing the rest needs photo-to-photo alignment along seams (not built).
+- Studio spends about 40 % of its time lining photos up with the phone's mesh (`align_to_phone_mesh`); using
+  fewer points per photo there is an easy speed-up that hasn't been tried.
+- About 6 % of the surface gets no photo (hidden in every photo) and shows the blurry fused colour.
+- Tour: no export yet (a self-contained web viewer would be the natural one); links ignore walls; eye height
+  is assumed.
 - Studio's camera refinement can't remove slow drift around a loop. Pose-graph optimisation with loop closure is
   the next big step for long scans.
 - Ultra is slow (18 min) and heavy; High is the sensible default.
