@@ -77,6 +77,9 @@ struct PanoramaStitcher {
         var gainCompensation = true
         /// Higher = narrower changeover between photos (less ghosting, more visible seams).
         var blendPower = 3
+        /// World heading (radians, 0 = ARKit's -z, turning toward +x) at the middle of the panorama.
+        /// nil puts the first photo in the middle. Tours use 0 so every stop shares the same axes.
+        var centreYaw: Double? = nil
     }
 
     struct Report {
@@ -159,7 +162,7 @@ struct PanoramaStitcher {
         // 4 and 5. Paint, then fill.
         progress(0.65, "Painting the panorama")
         let forward = sources[0].rotation * SIMD3<Double>(0, 0, -1)
-        let yaw0 = atan2(forward.x, -forward.z)          // the first photo is the middle of the panorama
+        let yaw0 = options.centreYaw ?? atan2(forward.x, -forward.z)   // by default the first photo is the middle
         let pixels = UnsafeMutablePointer<UInt8>.allocate(capacity: W * H * 4)
         defer { pixels.deallocate() }
         let covered = composite(sources, into: pixels, width: W, height: H, yaw0: yaw0, power: options.blendPower,

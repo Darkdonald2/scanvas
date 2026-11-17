@@ -34,15 +34,17 @@ enum Texturer {
         let sharpWeight = frames.map { min(1.5, max(0.4, ($0.sharpness / max(meanSharpness, 1)).squareRoot())) }
 
         /// True when the point at camera depth `z`, seen at keyframe pixel (u, v), is really what the photo shows:
-        /// nothing nearer is in front of it (checked over a 3×3 patch) and the surface is actually there.
+        /// nothing nearer is in front of it and the surface is actually there. "In front" is checked over a
+        /// 5×5 patch of the photo's depth: camera positions are never perfect, and without that margin the edge
+        /// of a chair or a person is painted onto the wall behind it.
         func visible(_ f: Keyframe, _ u: Float, _ v: Float, _ z: Float) -> Bool {
             guard !f.depth.isEmpty else { return true }
             let ui = Int(u), vi = Int(v)
-            guard ui >= 1, vi >= 1, ui < dw - 1, vi < dh - 1 else { return true }
+            guard ui >= 2, vi >= 2, ui < dw - 2, vi < dh - 2 else { return true }
             let tol = 0.03 + 0.02 * z
             var nearest: Float = .greatestFiniteMagnitude
-            for dy in -1...1 {
-                for dx in -1...1 {
+            for dy in -2...2 {
+                for dx in -2...2 {
                     let d = Float(f.depth[(vi + dy) * dw + ui + dx])
                     if d > 0 { nearest = min(nearest, d) }
                 }
@@ -80,24 +82,52 @@ enum Texturer {
             return facing * facing * facing * centred * sharpWeight[fi] / ((0.3 + zc) * (0.3 + zc))
         }
 
-        // Pass 1: best view per triangle, counted as votes per photo.
-        progress(Progress(message: "Choosing the best photo for each surface…", fraction: 0))
+        // Exposure: a brightness/colour gain per photo so neighbouring photos match.
+        progress(Progress(message: "Matching photo brightness…", fraction: 0))
+        let gains = exposureGains(mesh: mesh, frames: frames)
+
+        /// The colour photo fi shows at a world point (from its small copy, with its gain), or nil if unusable.
+        func colour(_ p: SIMD3<Float>, _ fi: Int) -> SIMD3<Float>? {
+            let f = frames[fi]
+            guard !f.rgb.isEmpty else { return nil }
+            let q = f.worldToCamera * SIMD4(p, 1)
+            let z = -q.z
+            guard z > 0.15 else { return nil }
+            let u = Int(f.fx * q.x / z + f.cx), v = Int(f.cy - f.fy * q.y / z)
+            guard u >= 0, v >= 0, u < dw, v < dh else { return nil }
+            let o = (v * dw + u) * 3
+            let c = SIMD3<Float>(Float(f.rgb[o]), Float(f.rgb[o + 1]), Float(f.rgb[o + 2]))
+            // Clipped and near-black pixels say nothing about brightness.
+            guard c.max() < 250, c.min() > 8 else { return nil }
+            return c * gains[fi]
+        }
+
+        // Pass 1: best view per triangle, counted as votes per photo. Along the way, the colour all the photos
+        // that see a triangle agree on is noted, to level out patches later.
+        progress(Progress(message: "Choosing the best photo for each surface…", fraction: 0.03))
         var best = [Int32](repeating: -1, count: triCount)
         var bestScore = [Float](repeating: 0, count: triCount)
+        var agreed = [SIMD3<Float>](repeating: .zero, count: triCount)
         let chunks = max(1, min(64, triCount / 2000))
         let chunkSize = (triCount + chunks - 1) / chunks
         best.withUnsafeMutableBufferPointer { bestBuf in
             bestScore.withUnsafeMutableBufferPointer { scoreBuf in
+              agreed.withUnsafeMutableBufferPointer { agreedBuf in
                 DispatchQueue.concurrentPerform(iterations: chunks) { ci in
                     for t in (ci * chunkSize)..<min(triCount, (ci + 1) * chunkSize) {
                         var bs: Float = 0, bi: Int32 = -1
+                        var sum = SIMD3<Float>.zero, weight: Float = 0
+                        let centre = (mesh.positions[Int(mesh.indices[3 * t])] + mesh.positions[Int(mesh.indices[3 * t + 1])] + mesh.positions[Int(mesh.indices[3 * t + 2])]) / 3
                         for fi in frames.indices {
                             let s = score(t, fi)
                             if s > bs { bs = s; bi = Int32(fi) }
+                            if s > 0, let c = colour(centre, fi) { sum += c * s; weight += s }
                         }
                         bestBuf[t] = bi; scoreBuf[t] = bs
+                        if weight > 0 { agreedBuf[t] = sum / weight }
                     }
                 }
+              }
             }
         }
         progress(Progress(message: "Choosing the best photo for each surface…", fraction: 0.4))
@@ -177,9 +207,14 @@ enum Texturer {
             }
         }
 
-        // Exposure: a brightness/colour gain per photo so neighbouring photos match.
+        // What each triangle's own photo shows there, next to the colour all photos agreed on: the difference
+        // is levelled out per patch below, so patches from different photos meet without a step in brightness.
         progress(Progress(message: "Matching photo brightness…", fraction: 0.66))
-        let gains = exposureGains(mesh: mesh, frames: frames)
+        var own = [SIMD3<Float>](repeating: .zero, count: triCount)
+        for t in 0..<triCount where choice[t] >= 0 && agreed[t] != .zero {
+            let centre = (mesh.positions[Int(mesh.indices[3 * t])] + mesh.positions[Int(mesh.indices[3 * t + 1])] + mesh.positions[Int(mesh.indices[3 * t + 2])]) / 3
+            if let c = colour(centre, Int(choice[t])) { own[t] = c }
+        }
         // From here on only the camera poses are needed.
         keyframes = []
         frames = frames.map { var f = $0; f.rgb = []; f.depth = []; return f }
@@ -223,7 +258,7 @@ enum Texturer {
         chartOf = [:]
         adjacency = []
 
-        struct Crop { var frame: Int; var tris: [Int]; var rect: CGRect; var page = 0; var origin = CGPoint.zero }
+        struct Crop { var frame: Int; var tris: [Int]; var rect: CGRect; var page = 0; var origin = CGPoint.zero; var gain = SIMD3<Float>(1, 1, 1) }
         var crops: [Crop] = []
         crops.reserveCapacity(chartTris.count)
         for tris in chartTris {
@@ -238,11 +273,25 @@ enum Texturer {
             let pad: Float = 4
             lo = simd_max(lo - pad, .zero); hi = simd_min(hi + pad, SIMD2(W, H))
             hi = simd_max(hi, lo + 1)
+            // The patch's gain: its photo's gain, times what brings the patch to the colour the photos agreed on.
+            var gain = gains[fi]
+            var wanted = SIMD3<Float>.zero, got = SIMD3<Float>.zero
+            var samples = 0
+            for t in tris where own[t] != .zero {
+                wanted += agreed[t]; got += own[t]; samples += 1
+            }
+            if samples >= 12, got.min() > 1 {
+                let level = simd_clamp(wanted / got, SIMD3<Float>(repeating: 0.8), SIMD3<Float>(repeating: 1.25))
+                gain *= level
+            }
             crops.append(Crop(frame: fi, tris: tris,
                               rect: CGRect(x: CGFloat(lo.x.rounded(.down)), y: CGFloat(lo.y.rounded(.down)),
-                                           width: CGFloat((hi.x - lo.x).rounded(.up)), height: CGFloat((hi.y - lo.y).rounded(.up)))))
+                                           width: CGFloat((hi.x - lo.x).rounded(.up)), height: CGFloat((hi.y - lo.y).rounded(.up))),
+                              gain: gain))
         }
         chartTris = []
+        agreed = []
+        own = []
 
         // Shrink everything evenly if the photos would need more than `maxPages` pages.
         let page = CGFloat(pageSize)
@@ -286,10 +335,10 @@ enum Texturer {
                         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
                               let photo = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
                         else { return }
-                        let g = gains[fi]
-                        let adjust = abs(g.x - 1) + abs(g.y - 1) + abs(g.z - 1) > 0.02
-                        let gr = Int(g.x * 256), gg = Int(g.y * 256), gb = Int(g.z * 256)
                         for crop in list {
+                            let g = crop.gain
+                            let adjust = abs(g.x - 1) + abs(g.y - 1) + abs(g.z - 1) > 0.02
+                            let gr = Int(g.x * 256), gg = Int(g.y * 256), gb = Int(g.z * 256)
                             guard let part = photo.cropping(to: crop.rect) else { continue }
                             let w = crop.rect.width * scale, h = crop.rect.height * scale
                             // Bitmap rows run top-down in memory, drawing coordinates bottom-up.

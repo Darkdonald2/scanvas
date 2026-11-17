@@ -11,7 +11,7 @@ enum StudioImport {
     }
 
     private static let damaged = ImportError(message: "The model file is damaged or incomplete. Send it to the phone again.")
-    private static let layout = ImportError(message: "This GLB isn't laid out the way Scanvas can read: it needs one mesh with one photo texture.")
+    private static let layout = ImportError(message: "This GLB isn't laid out the way Scanvas can read: it needs a mesh with photo textures.")
 
     /// Where an accessor's values sit in the file.
     private struct Span {
@@ -29,18 +29,18 @@ enum StudioImport {
         let binStart = 20 + jsonLength + 8
         guard let accessors = json["accessors"] as? [[String: Any]],
               let meshes = json["meshes"] as? [[String: Any]],
-              let prim = (meshes.first?["primitives"] as? [[String: Any]])?.first,
-              let attrs = prim["attributes"] as? [String: Int], let pos = attrs["POSITION"]
+              let prims = meshes.first?["primitives"] as? [[String: Any]], !prims.isEmpty,
+              let firstAttrs = prims[0]["attributes"] as? [String: Int], let firstPos = firstAttrs["POSITION"]
         else { throw layout }
 
         var views = json["bufferViews"] as? [[String: Any]] ?? []
         if views.isEmpty {
             // Scanvas Studio up to 1.0 left this table out of its files. Its layout is always the same
             // (positions, normals, texture coordinates, indices, then the picture), so rebuild the table.
-            guard let nor = attrs["NORMAL"], let tex = attrs["TEXCOORD_0"], let idx = prim["indices"] as? Int,
-                  [pos, nor, tex, idx].allSatisfy({ accessors.indices.contains($0) }) else { throw layout }
+            guard prims.count == 1, let nor = firstAttrs["NORMAL"], let tex = firstAttrs["TEXCOORD_0"], let idx = prims[0]["indices"] as? Int,
+                  [firstPos, nor, tex, idx].allSatisfy({ accessors.indices.contains($0) }) else { throw layout }
             var offset = 0
-            for (accessor, bytes) in [(pos, 12), (nor, 12), (tex, 8), (idx, 4)] {
+            for (accessor, bytes) in [(firstPos, 12), (nor, 12), (tex, 8), (idx, 4)] {
                 let length = (accessors[accessor]["count"] as? Int ?? 0) * bytes
                 views.append(["byteOffset": offset, "byteLength": length])
                 offset += (length + 3) & ~3
@@ -67,52 +67,78 @@ enum StudioImport {
             try span(accessor) { $0 == 5126 ? components * 4 : 0 }
         }
 
-        var page = TexturedMesh.Page()
-        page.positions = vec3(data, try floatSpan(pos, components: 3))
-        if let n = attrs["NORMAL"], let s = try? floatSpan(n, components: 3), s.count == page.positions.count {
-            page.normals = vec3(data, s)
-        }
-        guard let t = attrs["TEXCOORD_0"] else { throw ImportError(message: "This model has no photo texture.") }
-        // glTF and Scanvas both count texture rows from the top.
-        page.uvs = vec2(data, try floatSpan(t, components: 2))
-        if let idx = prim["indices"] as? Int {
-            page.indices = indices(data, try span(idx) { $0 == 5125 ? 4 : $0 == 5123 ? 2 : $0 == 5121 ? 1 : 0 })
-        } else {
-            page.indices = (0..<UInt32(page.positions.count)).map { $0 }
-        }
-        page.indices.removeLast(page.indices.count % 3)
-        guard !page.positions.isEmpty, !page.indices.isEmpty, page.uvs.count == page.positions.count else { throw layout }
-        let limit = UInt32(page.positions.count)
-        guard !page.indices.contains(where: { $0 >= limit }) else { throw damaged }
-
-        guard let images = json["images"] as? [[String: Any]], let iv = images.first?["bufferView"] as? Int, views.indices.contains(iv) else {
-            throw ImportError(message: "This model has no photo texture inside it. In Scanvas Studio, use model_textured.glb.")
-        }
-        let start = binStart + (views[iv]["byteOffset"] as? Int ?? 0), length = views[iv]["byteLength"] as? Int ?? 0
-        guard start >= binStart, length > 4, start + length <= data.count else { throw damaged }
-        var picture = data.subdata(in: start..<(start + length))
-        if !(picture[picture.startIndex] == 0xFF && picture[picture.startIndex + 1] == 0xD8) {
-            // Not a JPEG (GLBs from other programs often hold PNG): convert, since scans keep JPEG textures.
-            guard let jpeg = UIImage(data: picture)?.jpegData(compressionQuality: 0.92) else {
-                throw ImportError(message: "The model's texture picture couldn't be read.")
+        /// The picture a mesh part is textured with: material → texture → image → bytes in the file.
+        let images = json["images"] as? [[String: Any]] ?? []
+        let textures = json["textures"] as? [[String: Any]] ?? []
+        let materials = json["materials"] as? [[String: Any]] ?? []
+        func picture(for prim: [String: Any]) throws -> Data {
+            var image = 0
+            if let m = prim["material"] as? Int, materials.indices.contains(m),
+               let pbr = materials[m]["pbrMetallicRoughness"] as? [String: Any],
+               let base = pbr["baseColorTexture"] as? [String: Any], let t = base["index"] as? Int,
+               textures.indices.contains(t), let source = textures[t]["source"] as? Int {
+                image = source
             }
-            picture = jpeg
+            guard images.indices.contains(image), let iv = images[image]["bufferView"] as? Int, views.indices.contains(iv) else {
+                throw ImportError(message: "This model has no photo texture inside it. In Scanvas Studio, use model_textured.glb.")
+            }
+            let start = binStart + (views[iv]["byteOffset"] as? Int ?? 0), length = views[iv]["byteLength"] as? Int ?? 0
+            guard start >= binStart, length > 4, start + length <= data.count else { throw damaged }
+            var bytes = data.subdata(in: start..<(start + length))
+            if !(bytes[bytes.startIndex] == 0xFF && bytes[bytes.startIndex + 1] == 0xD8) {
+                // Not a JPEG (GLBs from other programs often hold PNG): convert, since scans keep JPEG textures.
+                guard let jpeg = UIImage(data: bytes)?.jpegData(compressionQuality: 0.92) else {
+                    throw ImportError(message: "The model's texture picture couldn't be read.")
+                }
+                bytes = jpeg
+            }
+            return bytes
         }
 
-        // Replace the scan's textures with the imported one.
+        // Read everything before touching the scan, so a bad file leaves it as it was. Studio writes one mesh
+        // part per texture page.
+        var pages: [TexturedMesh.Page] = []
+        var pictures: [Data] = []
+        for prim in prims {
+            guard let attrs = prim["attributes"] as? [String: Int], let pos = attrs["POSITION"] else { throw layout }
+            var page = TexturedMesh.Page()
+            page.positions = vec3(data, try floatSpan(pos, components: 3))
+            if let n = attrs["NORMAL"], let s = try? floatSpan(n, components: 3), s.count == page.positions.count {
+                page.normals = vec3(data, s)
+            }
+            guard let t = attrs["TEXCOORD_0"] else { throw ImportError(message: "This model has no photo texture.") }
+            // glTF and Scanvas both count texture rows from the top.
+            page.uvs = vec2(data, try floatSpan(t, components: 2))
+            if let idx = prim["indices"] as? Int {
+                page.indices = indices(data, try span(idx) { $0 == 5125 ? 4 : $0 == 5123 ? 2 : $0 == 5121 ? 1 : 0 })
+            } else {
+                page.indices = (0..<UInt32(page.positions.count)).map { $0 }
+            }
+            page.indices.removeLast(page.indices.count % 3)
+            guard !page.positions.isEmpty, !page.indices.isEmpty, page.uvs.count == page.positions.count else { throw layout }
+            let limit = UInt32(page.positions.count)
+            guard !page.indices.contains(where: { $0 >= limit }) else { throw damaged }
+            pictures.append(try picture(for: prim))
+            pages.append(page)
+        }
+
+        // Replace the scan's textures with the imported ones.
         let fm = FileManager.default
         for name in (try? fm.contentsOfDirectory(atPath: folder.path)) ?? [] where name.hasPrefix("tex_") && name.hasSuffix(".jpg") {
             try? fm.removeItem(at: folder.appendingPathComponent(name))
         }
-        try picture.write(to: folder.appendingPathComponent(TexturedMesh.textureName(0)), options: .atomic)
+        for (i, jpeg) in pictures.enumerated() {
+            try jpeg.write(to: folder.appendingPathComponent(TexturedMesh.textureName(i)), options: .atomic)
+        }
         var textured = TexturedMesh()
-        textured.pages = [page]
+        textured.pages = pages
         try textured.write(to: folder.appendingPathComponent(ProjectFile.textured))
-        let note = "\nstudio: imported \(page.indices.count / 3) triangles from Scanvas Studio"
+        let triangles = pages.reduce(0) { $0 + $1.indices.count / 3 }
+        let note = "\nstudio: imported \(triangles) triangles and \(pages.count) texture page(s) from Scanvas Studio"
         if let h = try? FileHandle(forWritingTo: folder.appendingPathComponent("processing.txt")) {
             h.seekToEndOfFile(); h.write(Data(note.utf8)); try? h.close()
         }
-        return page.indices.count / 3
+        return triangles
     }
 
     // MARK: Reading

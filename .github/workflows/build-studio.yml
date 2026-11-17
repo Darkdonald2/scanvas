@@ -44,6 +44,10 @@ jobs:
           python run_studio.py "$RUNNER_TEMP/synth" --out "$RUNNER_TEMP/out" --quality fast
           python tests/evaluate.py "$RUNNER_TEMP/out" "$RUNNER_TEMP/synth" 12
           python tests/check_glb.py "$RUNNER_TEMP/out/model_textured.glb"
+          # The same scan again with two texture pages (large scans get several).
+          python run_studio.py "$RUNNER_TEMP/synth" --out "$RUNNER_TEMP/out-pages" --quality fast --pages 2
+          python tests/check_glb.py "$RUNNER_TEMP/out-pages/model_textured.glb"
+          python tests/evaluate_real.py "$RUNNER_TEMP/out-pages" "$RUNNER_TEMP/synth"
       - name: Test on a scan whose first photos are 40 cm out of place
         run: |
           python tests/make_synthetic.py "$RUNNER_TEMP/drift" 40 0.4
