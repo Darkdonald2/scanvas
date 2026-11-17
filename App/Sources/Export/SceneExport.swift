@@ -75,7 +75,8 @@ enum SceneExport {
             let texture = folder.appendingPathComponent(TexturedMesh.textureName(i))
             // Many full-size pages together need more graphics memory than a phone has, so the viewer shows
             // them smaller. Exports (dollhouse off) always use the full-size pictures.
-            if dollhouse, live > 3, let small = smaller(texture, maxPixel: live > 6 ? 2048 : 3072) {
+            // (One 8192 page is fine; two to four are shown at 4096, more at 3072 or 2048.)
+            if dollhouse, live > 1, let small = smaller(texture, maxPixel: live > 6 ? 2048 : (live > 4 ? 3072 : 4096)) {
                 mat.diffuse.contents = small
             } else {
                 mat.diffuse.contents = texture

@@ -20,23 +20,31 @@ def check(path: Path) -> dict:
     views, accessors = g["bufferViews"], g["accessors"]
     for v in views:
         assert v["byteOffset"] % 4 == 0 and v["byteOffset"] + v["byteLength"] <= bin_len, "buffer view outside the file"
-    prim = g["meshes"][0]["primitives"][0]
     size = {"VEC3": 12, "VEC2": 8, "SCALAR": 4}
-    counts = {}
-    for name, a in list(prim["attributes"].items()) + [("indices", prim["indices"])]:
-        acc = accessors[a]
-        assert acc["count"] * size[acc["type"]] <= views[acc["bufferView"]]["byteLength"], f"{name} is larger than its buffer view"
-        counts[name] = acc["count"]
-    assert counts["POSITION"] == counts["NORMAL"] == counts["TEXCOORD_0"] > 0
-    assert counts["indices"] % 3 == 0 and counts["indices"] > 0
-    iv = views[g["images"][0]["bufferView"]]
-    start = 20 + json_len + 8 + iv["byteOffset"]
-    assert b[start:start + 2] == b"\xff\xd8", "the embedded texture isn't a JPEG"
-    idx_view = views[accessors[prim["indices"]]["bufferView"]]
-    i0 = 20 + json_len + 8 + idx_view["byteOffset"]
-    top = max(struct.unpack_from(f"<{counts['indices']}I", b, i0))
-    assert top < counts["POSITION"], "an index points past the last vertex"
-    return {"triangles": counts["indices"] // 3, "vertices": counts["POSITION"], "texture_bytes": iv["byteLength"]}
+    triangles = vertices = texture_bytes = 0
+    prims = g["meshes"][0]["primitives"]
+    assert prims, "no mesh parts"
+    for prim in prims:
+        counts = {}
+        for name, a in list(prim["attributes"].items()) + [("indices", prim["indices"])]:
+            acc = accessors[a]
+            assert acc["count"] * size[acc["type"]] <= views[acc["bufferView"]]["byteLength"], f"{name} is larger than its buffer view"
+            counts[name] = acc["count"]
+        assert counts["POSITION"] == counts["NORMAL"] == counts["TEXCOORD_0"] > 0
+        assert counts["indices"] % 3 == 0 and counts["indices"] > 0
+        # material -> texture -> image -> bytes
+        tex = g["materials"][prim["material"]]["pbrMetallicRoughness"]["baseColorTexture"]["index"]
+        iv = views[g["images"][g["textures"][tex]["source"]]["bufferView"]]
+        start = 20 + json_len + 8 + iv["byteOffset"]
+        assert b[start:start + 2] == b"\xff\xd8", "an embedded texture isn't a JPEG"
+        idx_view = views[accessors[prim["indices"]]["bufferView"]]
+        i0 = 20 + json_len + 8 + idx_view["byteOffset"]
+        top = max(struct.unpack_from(f"<{counts['indices']}I", b, i0))
+        assert top < counts["POSITION"], "an index points past the last vertex"
+        triangles += counts["indices"] // 3
+        vertices += counts["POSITION"]
+        texture_bytes += iv["byteLength"]
+    return {"parts": len(prims), "triangles": triangles, "vertices": vertices, "texture_bytes": texture_bytes}
 
 
 if __name__ == "__main__":

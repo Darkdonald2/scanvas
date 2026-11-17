@@ -16,6 +16,7 @@ def main(argv=None):
     ap.add_argument("--no-refine", action="store_true", help="skip camera refinement")
     ap.add_argument("--no-smooth", action="store_true")
     ap.add_argument("--no-texture", action="store_true", help="coloured mesh only")
+    ap.add_argument("--pages", type=int, default=0, help="texture pages (default: as many as the scan's size needs)")
     ap.add_argument("--z-up", action="store_true", help="Z up instead of Y up (Revit, AutoCAD, Rhino)")
     ap.add_argument("--serve", action="store_true", help="receive and process scans from the iPhone over Wi-Fi without a window")
     ap.add_argument("--view", help="open a result (.obj, .glb or results folder) in a 3D window")
@@ -37,7 +38,7 @@ def main(argv=None):
     src = Path(a.capture)
     out = Path(a.out) if a.out else (src.parent if src.is_file() else src.parent) / f"{cap.name} - Studio"
     s = Settings(quality=a.quality, refine_cameras=not a.no_refine, smooth=not a.no_smooth,
-                 texture=not a.no_texture, z_up=a.z_up)
+                 texture=not a.no_texture, z_up=a.z_up, texture_pages=max(0, a.pages))
     last = [""]
     t0 = time.time()
 

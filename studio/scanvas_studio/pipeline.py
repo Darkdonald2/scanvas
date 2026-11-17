@@ -37,6 +37,7 @@ class Settings:
     max_depth: float = 4.5         # metres: LiDAR gets noisy further away
     min_confidence: int = 1        # 0 low, 1 medium, 2 high
     texture_limit: int = 0         # override for the texturing triangle budget (0 = quality default)
+    texture_pages: int = 0         # number of texture pages (0 = as many as the scan's size needs)
 
     @property
     def voxel(self) -> float:
@@ -53,6 +54,15 @@ class Settings:
     @property
     def texture_size(self) -> int:
         return {"fast": 4096, "high": 8192, "ultra": 8192}[self.quality]
+
+    def pages_for(self, area: float) -> int:
+        """Texture pages for a scan with this much surface (m²): enough for about 1 mm per texel, which is
+        close to what the photos hold at room distances. One 8192 page covers roughly 33 m² at that detail."""
+        if self.texture_pages:
+            return self.texture_pages
+        most = {"fast": 1, "high": 4, "ultra": 6}[self.quality]
+        per_page = self.texture_size ** 2 * 0.5 * 1e-6
+        return int(min(most, max(1, math.ceil(area / per_page))))
 
     @property
     def texture_triangles(self) -> int:
@@ -428,10 +438,32 @@ def make_manifold(mesh, rounds: int = 6):
     return mesh
 
 
+def split_pages(V: np.ndarray, F: np.ndarray, pages: int) -> list[np.ndarray]:
+    """Splits the triangles into `pages` groups of about equal area that each cover one part of the space
+    (cut after cut across the longest side), so each group can have a texture page of its own."""
+    a, b, c = V[F[:, 0]], V[F[:, 1]], V[F[:, 2]]
+    area = np.linalg.norm(np.cross(b - a, c - a), axis=1) / 2
+    cent = (a + b + c) / 3
+
+    def cut(idx: np.ndarray, k: int) -> list[np.ndarray]:
+        if k <= 1 or len(idx) < 2:
+            return [idx]
+        left = k // 2
+        span = cent[idx].max(0) - cent[idx].min(0)
+        axis = int(np.argmax(span))
+        order = idx[np.argsort(cent[idx, axis], kind="stable")]
+        cum = np.cumsum(area[order])
+        at = int(np.searchsorted(cum, cum[-1] * left / k))
+        at = min(max(at, 1), len(order) - 1)
+        return cut(order[:at], left) + cut(order[at:], k - left)
+
+    return cut(np.arange(len(F)), pages)
+
+
 def texture(mesh, frames: list[Frame], s: Settings, report: Report, base: float, span: float):
-    """Returns a tensor mesh with UVs and an albedo texture, or None when it can't be done."""
+    """Unwraps the mesh onto one or more texture pages and paints them from the photos.
+    Returns the textured model's arrays, or raises when it can't be done."""
     o3d = _o3d()
-    o3c = o3d.core
     work = mesh
     if len(work.triangles) > s.texture_triangles:
         report(f"Texturing: simplifying to {s.texture_triangles:,} triangles", base)
@@ -439,24 +471,51 @@ def texture(mesh, frames: list[Frame], s: Settings, report: Report, base: float,
         work.remove_unreferenced_vertices()
     work = make_manifold(work)
     work.compute_vertex_normals()
-    t = o3d.t.geometry.TriangleMesh.from_legacy(work)
-    report("Texturing: unwrapping the surface (this can take a few minutes)", base + span * 0.03)
-    try:
-        t.compute_uvatlas(size=s.texture_size, gutter=2.0, max_stretch=0.16, parallel_partitions=8, nthreads=0)
-    except RuntimeError:
-        # Splitting into parallel parts can itself leave a tangled spot; unwrap in one piece instead (slower).
-        t = o3d.t.geometry.TriangleMesh.from_legacy(make_manifold(work, 12))
-        t.compute_uvatlas(size=s.texture_size, gutter=2.0, max_stretch=0.16, parallel_partitions=1, nthreads=0)
-    V = t.vertex.positions.numpy().astype(np.float64)
-    F = t.triangle.indices.numpy().astype(np.int64)
-    UV = t.triangle.texture_uvs.numpy().astype(np.float64)
-    colours = t.vertex.colors.numpy().astype(np.float32) if "colors" in t.vertex else None
-    if colours is None or len(colours) != len(V):
-        colours = _nearest_colours(mesh, V)
-    normals = np.asarray(work.vertex_normals) if len(work.vertex_normals) == len(V) else np.zeros_like(V)
+    V0 = np.asarray(work.vertices)
+    F0 = np.asarray(work.triangles)
+    C0 = np.asarray(work.vertex_colors)
+    if len(C0) != len(V0):
+        C0 = _nearest_colours(mesh, V0)
+    N0 = np.asarray(work.vertex_normals)
+    pages = s.pages_for(work.get_surface_area())
+    Vs, Fs, UVs, Cs, Ns, Ps = [], [], [], [], [], []
+    start = 0
+    for p, tris in enumerate(split_pages(V0, F0, pages)):
+        report(f"Texturing: unwrapping the surface, part {p + 1} of {pages} (this can take a few minutes)", base + span * 0.08 * p / pages)
+        part = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V0), o3d.utility.Vector3iVector(F0[tris]))
+        if C0 is not None and len(C0) == len(V0):
+            part.vertex_colors = o3d.utility.Vector3dVector(C0)
+        part.vertex_normals = o3d.utility.Vector3dVector(N0)
+        part.remove_unreferenced_vertices()
+        # Cutting can leave a vertex where two fans of triangles only touch; the unwrapper can't take those.
+        part = make_manifold(part) if pages > 1 else part
+        t = o3d.t.geometry.TriangleMesh.from_legacy(part)
+        try:
+            t.compute_uvatlas(size=s.texture_size, gutter=2.0, max_stretch=0.16, parallel_partitions=8, nthreads=0)
+        except RuntimeError:
+            # Splitting into parallel parts can itself leave a tangled spot; unwrap in one piece instead (slower).
+            t = o3d.t.geometry.TriangleMesh.from_legacy(make_manifold(part, 12))
+            t.compute_uvatlas(size=s.texture_size, gutter=2.0, max_stretch=0.16, parallel_partitions=1, nthreads=0)
+        v = t.vertex.positions.numpy().astype(np.float64)
+        f = t.triangle.indices.numpy().astype(np.int64)
+        Vs.append(v)
+        Fs.append(f + start)
+        UVs.append(t.triangle.texture_uvs.numpy().astype(np.float64))
+        Cs.append(t.vertex.colors.numpy().astype(np.float32) if "colors" in t.vertex else np.full((len(v), 3), 0.6, np.float32))
+        Ns.append(t.vertex.normals.numpy().astype(np.float64) if "normals" in t.vertex else np.zeros_like(v))
+        Ps.append(np.full(len(f), p, np.int32))
+        start += len(v)
+    V, F, UV = np.concatenate(Vs), np.concatenate(Fs), np.concatenate(UVs)
+    colours, normals, page_of = np.concatenate(Cs), np.concatenate(Ns), np.concatenate(Ps)
+    if pages > 1:
+        # Vertices along the cuts exist once per part; join them again so neighbouring triangles on different
+        # pages still count as neighbours when photos and colours are matched.
+        _, first, inverse = np.unique(V, axis=0, return_index=True, return_inverse=True)
+        V, colours, normals = V[first], colours[first], normals[first]
+        F = inverse.reshape(-1)[F]
     photos = spread_frames(frames, s.texture_photos)
-    image, stats = bake(V, F, UV, colours, photos, s.texture_size, report, base + span * 0.1, span * 0.9)
-    return {"V": V, "F": F, "UV": UV, "normals": normals, "image": image, "stats": stats}
+    images, keep, stats = bake(V, F, UV, colours, photos, s.texture_size, report, base + span * 0.1, span * 0.9, page_of=page_of)
+    return {"V": V, "F": F[keep], "UV": UV[keep], "normals": normals, "page_of": page_of[keep], "images": images, "stats": stats}
 
 
 def _nearest_colours(mesh, V: np.ndarray):
@@ -506,22 +565,21 @@ def export(out: Path, dense, textured, s: Settings, report: Report) -> list[Path
         if s.z_up:
             R = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=np.float64)
             V, N = V @ R.T, N @ R.T
-        import io
-        buf = io.BytesIO()
-        Image.fromarray(textured["image"]).save(buf, "JPEG", quality=93, subsampling=0)
-        jpeg = buf.getvalue()
-        tex = out / "model_textured.jpg"
-        tex.write_bytes(jpeg)
+        jpegs, page_of = textured["images"], textured["page_of"]
+        # One page keeps the old file name; several are numbered.
+        names = ["model_textured.jpg"] if len(jpegs) == 1 else [f"model_textured_{i}.jpg" for i in range(len(jpegs))]
+        for name, jpeg in zip(names, jpegs):
+            (out / name).write_bytes(jpeg)
         p = out / "model_textured.obj"
-        write_obj(p, V, textured["F"], textured["UV"], N, tex.name)
-        files += [p, p.with_suffix(".mtl"), tex]
+        write_obj(p, V, textured["F"], textured["UV"], N, names, page_of)
+        files += [p, p.with_suffix(".mtl")] + [out / n for n in names]
         p = out / "model_textured.glb"
-        write_glb(p, V, textured["F"], textured["UV"], N, jpeg)
+        write_glb(p, V, textured["F"], textured["UV"], N, jpegs, page_of)
         files.append(p)
         if s.z_up:
             # The phone works in its own Y-up coordinates, so it gets an unrotated copy.
             p = out / "phone_model.glb"
-            write_glb(p, textured["V"], textured["F"], textured["UV"], textured["normals"], jpeg)
+            write_glb(p, textured["V"], textured["F"], textured["UV"], textured["normals"], jpegs, page_of)
             files.append(p)
     else:
         p = out / "model_dense_colour.obj"

@@ -123,7 +123,8 @@ def score_photos(V, F, frames: list[Frame], depth_render, report: Report, base: 
     n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
     del a, b, c
     if state is None:
-        state = {"L": np.full((T, K), -1, np.int32), "S": np.zeros((T, K), np.float32), "hidden": 0, "changed": 0}
+        state = {"L": np.full((T, K), -1, np.int32), "S": np.zeros((T, K), np.float32), "hidden": 0, "changed": 0,
+                 "agree": np.zeros(T, np.uint16), "through": np.zeros(T, np.uint16)}
     bestL, bestS = state["L"], state["S"]
     sharp = np.array([max(f.sharpness, 1.0) for f in frames])
     sharp_w = np.clip(np.sqrt(sharp / np.median(sharp)), 0.4, 1.5)
@@ -171,6 +172,10 @@ def score_photos(V, F, frames: list[Frame], depth_render, report: Report, base: 
             known = np.isfinite(d)
             tol2 = 0.04 + 0.02 * zi + 1.5 * zi * slope / (f.fx * s2)
             same = ~known | (np.abs(d - zi) <= tol2)
+            # For telling real surfaces from passers-by: did this photo's LiDAR find the surface where the model
+            # has it, or did it look straight through that spot to something further away?
+            state["agree"][idx[vis & known & same]] += 1
+            state["through"][idx[vis & known & (d > zi + tol2 + 0.05)]] += 1
             state["changed"] += int((vis & ~same).sum())
             vis &= same
             weight[~known] = 0.6          # not checked by LiDAR (too far or unsure): allowed, but not preferred
@@ -220,19 +225,58 @@ def choose_photos(V, F, frames, state: dict, report: Report, base: float, span: 
     return label, gains, offsets
 
 
+def transient(state: dict, F: np.ndarray) -> np.ndarray:
+    """True for triangles that were only there for a moment: several photos' LiDAR looked straight through the
+    spot, and far fewer found a surface there. That is what someone walking through the scan leaves behind.
+    Lone triangles are not removed, only patches, so thin things the LiDAR half-misses keep their shape."""
+    through, agree = state["through"].astype(np.int32), state["agree"].astype(np.int32)
+    gone = (through >= 4) & (through >= 3 * np.maximum(agree, 1))
+    if not gone.any():
+        return gone
+    # Keep a triangle unless most of its neighbours go too (drops speckle; keeps whole patches).
+    nb = _neighbours(F)
+    for _ in range(2):
+        votes = np.where(nb >= 0, gone[np.maximum(nb, 0)], False).sum(axis=1)
+        gone = gone & (votes >= 2) | (~gone & (votes == 3) & (through >= 2) & (through > agree))
+    return gone
+
+
 def bake(V: np.ndarray, F: np.ndarray, UV: np.ndarray, vertex_colors: np.ndarray | None,
          frames: list[Frame], size: int, report: Report, base: float, span: float,
-         depth_render=None) -> tuple[np.ndarray, dict]:
-    """Returns the texture image (size x size x 3, row 0 = top, v = 1) and stats."""
+         depth_render=None, page_of: np.ndarray | None = None, remove_transient: bool = True):
+    """Paints the texture pages. Returns (JPEG bytes per page, triangles kept (bool, per triangle), stats).
+    `page_of` says which page each triangle's UVs are on (all on page 0 when left out)."""
+    import io
     if depth_render is None:
         depth_render = raycast_depth(V, F)
+    if page_of is None:
+        page_of = np.zeros(len(F), np.int32)
     state = score_photos(V, F, frames, depth_render, report, base, span * 0.3)
+    keep = np.ones(len(F), bool)
+    if remove_transient:
+        gone = transient(state, F)
+        # Never more than a small part of the model: if it is, something else is wrong and nothing is removed.
+        if 0 < gone.sum() < 0.08 * len(F):
+            keep = ~gone
     label, gains, offsets = choose_photos(V, F, frames, state, report, base + span * 0.3, span * 0.2)
-    tex, used = paint(V, F, UV, vertex_colors, frames, label, gains, offsets, size, report, base + span * 0.5, span * 0.5)
-    stats = {"texture_photos": used, "untextured_triangles": int((label < 0).sum()),
-             "triangles": int(len(F)), "texture_size": size,
+    pages = int(page_of.max()) + 1 if len(page_of) else 1
+    images, used_all = [], set()
+    for p in range(pages):
+        sel = np.nonzero((page_of == p) & keep)[0]
+        lo = base + span * (0.5 + 0.5 * p / pages)
+        name = "Texturing" if pages == 1 else f"Texturing page {p + 1} of {pages}"
+        tex, used = paint(V, F[sel], UV[sel], vertex_colors, frames, label[sel], gains, offsets[sel], size,
+                          lambda m, f: report(m.replace("Texturing", name, 1), f), lo, span * 0.5 / pages)
+        used_all.update(used)
+        buf = io.BytesIO()
+        Image.fromarray(tex).save(buf, "JPEG", quality=93, subsampling=0)
+        images.append(buf.getvalue())
+        del tex
+    stats = {"texture_photos": len(used_all), "untextured_triangles": int(((label < 0) & keep).sum()),
+             "triangles": int(keep.sum()), "texture_size": size, "texture_pages": pages,
+             "transient_triangles_removed": int((~keep).sum()),
              "views_rejected_hidden": state["hidden"], "views_rejected_changed": state["changed"]}
-    return tex, stats
+    return images, keep, stats
 
 
 def paint(V, F, UV, vertex_colors, frames, label, gains, offsets, size: int, report: Report, base: float, span: float):
@@ -316,7 +360,7 @@ def paint(V, F, UV, vertex_colors, frames, label, gains, offsets, size: int, rep
     del filled, tri_of, lab, order, lab_sorted
     _fill_gaps(tex, painted.reshape(size, size))
 
-    return tex, int(len(used))
+    return tex, [int(x) for x in used]
 
 
 def _small_photo(f: Frame, factor: int = 8) -> np.ndarray:
@@ -445,55 +489,81 @@ def _fill_gaps(tex: np.ndarray, painted: np.ndarray):
 
 # ---------------------------------------------------------------------------------------------- writers
 
-def write_obj(path, V, F, UV, normals, texture_name: str):
+def write_obj(path, V, F, UV, normals, texture_names: list[str], page_of: np.ndarray | None = None):
+    """OBJ with one material per texture page."""
+    if page_of is None:
+        page_of = np.zeros(len(F), np.int32)
     mtl = path.with_suffix(".mtl")
-    mtl.write_text(f"newmtl scan\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\nillum 1\nmap_Kd {texture_name}\n")
+    mtl.write_text("".join(f"newmtl scan{i}\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\nillum 1\nmap_Kd {name}\n\n"
+                           for i, name in enumerate(texture_names)))
     T = len(F)
     with open(path, "w", newline="\n") as fh:
-        fh.write(f"# Scanvas Studio\nmtllib {mtl.name}\nusemtl scan\n")
+        fh.write(f"# Scanvas Studio\nmtllib {mtl.name}\n")
         fh.write("".join(f"v {x:.5f} {y:.5f} {z:.5f}\n" for x, y, z in V))
         fh.write("".join(f"vn {x:.4f} {y:.4f} {z:.4f}\n" for x, y, z in normals))
         uv = UV.reshape(-1, 2)
         fh.write("".join(f"vt {u:.6f} {v:.6f}\n" for u, v in uv))
         f1 = F + 1
         t1 = np.arange(T * 3).reshape(T, 3) + 1
-        fh.write("".join(f"f {a}/{ta}/{a} {b}/{tb}/{b} {c}/{tc}/{c}\n"
-                         for (a, b, c), (ta, tb, tc) in zip(f1.tolist(), t1.tolist())))
+        for i in range(len(texture_names)):
+            sel = np.nonzero(page_of == i)[0]
+            fh.write(f"usemtl scan{i}\n")
+            fh.write("".join(f"f {a}/{ta}/{a} {b}/{tb}/{b} {c}/{tc}/{c}\n"
+                             for (a, b, c), (ta, tb, tc) in zip(f1[sel].tolist(), t1[sel].tolist())))
 
 
-def write_glb(path, V, F, UV, normals, jpeg: bytes):
-    """Binary glTF with the photo texture embedded; unlit, because the photos already hold the room's lighting."""
+def write_glb(path, V, F, UV, normals, jpegs: list[bytes], page_of: np.ndarray | None = None):
+    """Binary glTF with the photo textures embedded, one mesh part per texture page; unlit, because the photos
+    already hold the room's lighting."""
     import json
     import struct
-    pos = V[F].reshape(-1, 3).astype(np.float32)
-    nor = normals[F].reshape(-1, 3).astype(np.float32)
-    uv = UV.reshape(-1, 2).astype(np.float32).copy()
-    uv[:, 1] = 1 - uv[:, 1]        # glTF texture coordinates start at the top
-    idx = np.arange(len(pos), dtype=np.uint32)
-    blobs = [pos.tobytes(), nor.tobytes(), uv.tobytes(), idx.tobytes(), jpeg]
-    views, offset = [], 0
-    data = b""
-    for i, blob in enumerate(blobs):
+    if isinstance(jpegs, (bytes, bytearray)):
+        jpegs = [jpegs]
+    if page_of is None:
+        page_of = np.zeros(len(F), np.int32)
+    views, accessors, prims, chunks = [], [], [], []
+    offset = 0
+
+    def add(blob: bytes, target=None) -> int:
+        nonlocal offset
         pad = (-len(blob)) % 4
-        views.append({"buffer": 0, "byteOffset": offset, "byteLength": len(blob), **({"target": 34962} if i < 3 else {"target": 34963} if i == 3 else {})})
-        data += blob + b"\0" * pad
+        view = {"buffer": 0, "byteOffset": offset, "byteLength": len(blob)}
+        if target:
+            view["target"] = target
+        views.append(view)
+        chunks.append(blob + b"\0" * pad)
         offset += len(blob) + pad
+        return len(views) - 1
+
+    image_views = []
+    for i, jpeg in enumerate(jpegs):
+        f = F[page_of == i]
+        pos = V[f].reshape(-1, 3).astype(np.float32)
+        nor = normals[f].reshape(-1, 3).astype(np.float32)
+        uv = UV[page_of == i].reshape(-1, 2).astype(np.float32).copy()
+        uv[:, 1] = 1 - uv[:, 1]        # glTF texture coordinates start at the top
+        idx = np.arange(len(pos), dtype=np.uint32)
+        first = len(accessors)
+        accessors.append({"bufferView": add(pos.tobytes(), 34962), "componentType": 5126, "count": len(pos), "type": "VEC3",
+                          "min": pos.min(0).tolist() if len(pos) else [0, 0, 0], "max": pos.max(0).tolist() if len(pos) else [0, 0, 0]})
+        accessors.append({"bufferView": add(nor.tobytes(), 34962), "componentType": 5126, "count": len(nor), "type": "VEC3"})
+        accessors.append({"bufferView": add(uv.tobytes(), 34962), "componentType": 5126, "count": len(uv), "type": "VEC2"})
+        accessors.append({"bufferView": add(idx.tobytes(), 34963), "componentType": 5125, "count": len(idx), "type": "SCALAR"})
+        image_views.append(add(jpeg))
+        prims.append({"attributes": {"POSITION": first, "NORMAL": first + 1, "TEXCOORD_0": first + 2}, "indices": first + 3, "material": i})
+    data = b"".join(chunks)
+    n = len(jpegs)
     gltf = {
         "asset": {"version": "2.0", "generator": "Scanvas Studio"},
         "extensionsUsed": ["KHR_materials_unlit"],
         "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0, "name": "Scan"}],
-        "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2}, "indices": 3, "material": 0}]}],
-        "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}, "metallicFactor": 0, "roughnessFactor": 1},
-                       "extensions": {"KHR_materials_unlit": {}}, "doubleSided": True}],
-        "textures": [{"source": 0, "sampler": 0}], "samplers": [{"magFilter": 9729, "minFilter": 9987}],
-        "images": [{"bufferView": 4, "mimeType": "image/jpeg"}],
+        "meshes": [{"primitives": prims}],
+        "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": i}, "metallicFactor": 0, "roughnessFactor": 1},
+                       "extensions": {"KHR_materials_unlit": {}}, "doubleSided": True} for i in range(n)],
+        "textures": [{"source": i, "sampler": 0} for i in range(n)], "samplers": [{"magFilter": 9729, "minFilter": 9987}],
+        "images": [{"bufferView": v, "mimeType": "image/jpeg"} for v in image_views],
         "bufferViews": views,
-        "accessors": [
-            {"bufferView": 0, "componentType": 5126, "count": len(pos), "type": "VEC3", "min": pos.min(0).tolist(), "max": pos.max(0).tolist()},
-            {"bufferView": 1, "componentType": 5126, "count": len(nor), "type": "VEC3"},
-            {"bufferView": 2, "componentType": 5126, "count": len(uv), "type": "VEC2"},
-            {"bufferView": 3, "componentType": 5125, "count": len(idx), "type": "SCALAR"},
-        ],
+        "accessors": accessors,
         "buffers": [{"byteLength": len(data)}],
     }
     js = json.dumps(gltf, separators=(",", ":")).encode()
