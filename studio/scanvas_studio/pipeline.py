@@ -411,16 +411,6 @@ def clean(mesh, s: Settings, report: Report):
         small = areas < max(0.05, total * 0.002)
         mesh.remove_triangles_by_mask(small[clusters])
         mesh.remove_unreferenced_vertices()
-    if len(mesh.triangles):
-        # Close pinholes (up to about 15 cm across). Larger gaps are left open: they are usually real, such as
-        # windows the LiDAR looks straight through.
-        try:
-            before = len(mesh.triangles)
-            filled = o3d.t.geometry.TriangleMesh.from_legacy(mesh).fill_holes(hole_size=0.08).to_legacy()
-            if len(filled.vertices) == len(mesh.vertices) and before <= len(filled.triangles) <= before * 1.1:
-                mesh = filled
-        except Exception:
-            pass
     if s.smooth and len(mesh.triangles):
         report("Cleaning: smoothing noise", 0)
         colors = np.asarray(mesh.vertex_colors).copy()
