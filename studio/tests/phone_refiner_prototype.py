@@ -1,9 +1,10 @@
-"""Prototype of the phone's new camera refiner (to be ported to Swift line by line), run on a raw capture.
+"""Prototype of the phone's camera refiner (App/Sources/Process/CameraRefiner.swift follows it step by step),
+run on a raw capture: python tests/phone_refiner_prototype.py <raw capture folder> [every Nth photo].
 Target = triangle centres + normals of the phone's own mesh. Search uses a KD-tree here; the phone uses grids."""
 import sys, time, json
 import numpy as np
 from scipy.spatial import cKDTree
-sys.path.insert(0, "/home/claude/scanvas/studio")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 from scanvas_studio.capture import Capture
 import open3d as o3d
 

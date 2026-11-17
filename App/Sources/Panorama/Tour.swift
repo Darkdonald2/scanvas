@@ -202,11 +202,13 @@ struct TourCaptureView: View {
     @State private var step = "Stitching"
     @State private var confirmCancel = false
     @State private var ending = false
-    let project: ScanProject
+    /// Kept as state: the screen that presents this one makes a new project value (with a new id) every time
+    /// it redraws, and this capture must stay with the one it started with.
+    @State private var project: ScanProject
     var onSaved: (ScanProject) -> Void
 
     init(project: ScanProject, onSaved: @escaping (ScanProject) -> Void) {
-        self.project = project
+        _project = State(initialValue: project)
         self.onSaved = onSaved
         let stops = ProjectStore.folder(for: project.id).appendingPathComponent(ProjectFile.tourStops, isDirectory: true)
         _model = StateObject(wrappedValue: PanoramaCaptureModel(folder: stops))
