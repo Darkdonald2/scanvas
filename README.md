@@ -11,6 +11,9 @@ A free LiDAR 3D scanner for iPhone and iPad. No account, no subscription, no pay
 | **Object** | Apple Object Capture guided scanning → textured USDZ model. |
 | **Photos** | Turn 20–200 photos into a textured 3D model on the device. |
 | **Measure** | AR tape measure with multi-point paths and totals. |
+| **Pipes** | Trace drainage runs with lengths, falls, levels and photos. |
+| **360 Photo** | Guided photos all around you, stitched on the phone into a 360° panorama (tagged for 360 viewers). Look around by dragging, with the joystick, or by moving the phone. |
+| **Tour** | Several 360s taken as you walk through a floor. The app tracks where each one is, so you can walk from stop to stop with the joystick, floor arrows or the map, like a street-level map of the building. |
 
 Every scan opens in a 3D viewer (colour / surface / wireframe shading, tap-to-measure) and a 2D plan view (rooms: full plan with dimensions; spaces: adjustable horizontal section).
 
@@ -52,6 +55,7 @@ This generates `Scanvas.xcodeproj` with XcodeGen and builds an unsigned `Scanvas
 ```
 App/Sources
 ├── Capture/   RoomPlan, LiDAR mesh scanner, Object Capture, Photos → 3D, AR measure
+├── Panorama/  360 photo capture and stitching, tours, the 360 viewer
 ├── Convert/   RoomPlan → plan model
 ├── Export/    DXF, IFC, OBJ/PLY/STL/GLB/PTS/XYZ, USDZ, PDF/PNG plan writers
 ├── Models/    Plan model, mesh data, projects

@@ -155,7 +155,8 @@ def _device():
     return o3d.core.Device("CPU:0")
 
 
-def fuse(frames: list[Frame], s: Settings, report: Report, base: float, span: float, label: str):
+def fuse(frames: list[Frame], s: Settings, report: Report, base: float, span: float, label: str,
+         weight_threshold: float = 1.5, edge_grow: int = 1):
     o3d = _o3d()
     o3c = o3d.core
     device = _device()
@@ -168,7 +169,7 @@ def fuse(frames: list[Frame], s: Settings, report: Report, base: float, span: fl
     for i, f in enumerate(frames):
         if i % 10 == 0:
             report(f"{label} ({i + 1} of {len(frames)})", base + span * i / max(1, len(frames)))
-        d = f.load_depth(s.min_confidence, s.max_depth, drop_edges=True)
+        d = f.load_depth(s.min_confidence, s.max_depth, drop_edges=True, grow=edge_grow)
         if not np.any(d):
             continue
         # Colour at half resolution is plenty for the volume; the texture uses full-resolution photos.
@@ -184,7 +185,7 @@ def fuse(frames: list[Frame], s: Settings, report: Report, base: float, span: fl
         coords = vbg.compute_unique_block_coordinates(depth, dk, ext, 1.0, s.max_depth)
         vbg.integrate(coords, depth, color, dk, ck, ext, 1.0, s.max_depth)
     report(f"{label}: building the surface", base + span)
-    mesh = vbg.extract_triangle_mesh(weight_threshold=1.5)
+    mesh = vbg.extract_triangle_mesh(weight_threshold=weight_threshold)
     return mesh.to_legacy()
 
 
@@ -405,10 +406,21 @@ def clean(mesh, s: Settings, report: Report):
         clusters = np.asarray(clusters)
         areas = np.asarray(areas)
         total = areas.sum()
-        # A piece is a floater when it is tiny next to the scan (people walking by, reflections, dust).
-        small = areas < max(0.02, total * 0.0005)
+        # A piece is a floater when it is small next to the scan and joined to nothing else (reflections,
+        # things glimpsed through a window or a doorway, someone walking by).
+        small = areas < max(0.05, total * 0.002)
         mesh.remove_triangles_by_mask(small[clusters])
         mesh.remove_unreferenced_vertices()
+    if len(mesh.triangles):
+        # Close pinholes (up to about 15 cm across). Larger gaps are left open: they are usually real, such as
+        # windows the LiDAR looks straight through.
+        try:
+            before = len(mesh.triangles)
+            filled = o3d.t.geometry.TriangleMesh.from_legacy(mesh).fill_holes(hole_size=0.08).to_legacy()
+            if len(filled.vertices) == len(mesh.vertices) and before <= len(filled.triangles) <= before * 1.1:
+                mesh = filled
+        except Exception:
+            pass
     if s.smooth and len(mesh.triangles):
         report("Cleaning: smoothing noise", 0)
         colors = np.asarray(mesh.vertex_colors).copy()
@@ -463,6 +475,17 @@ def split_pages(V: np.ndarray, F: np.ndarray, pages: int) -> list[np.ndarray]:
 def texture(mesh, frames: list[Frame], s: Settings, report: Report, base: float, span: float):
     """Unwraps the mesh onto one or more texture pages and paints them from the photos.
     Returns the textured model's arrays, or raises when it can't be done."""
+    m = unwrap(mesh, s, report, base, span * 0.1)
+    photos = spread_frames(frames, s.texture_photos)
+    images, keep, stats = bake(m["V"], m["F"], m["UV"], m["colours"], photos, s.texture_size, report,
+                               base + span * 0.1, span * 0.9, page_of=m["page_of"])
+    return {"V": m["V"], "F": m["F"][keep], "UV": m["UV"][keep], "normals": m["normals"], "page_of": m["page_of"][keep],
+            "images": images, "stats": stats}
+
+
+def unwrap(mesh, s: Settings, report: Report, base: float, span: float) -> dict:
+    """Simplifies the mesh to the texturing budget and lays it out flat on its texture pages.
+    Returns V, F, UV (per triangle corner), colours and normals (per vertex) and page_of (per triangle)."""
     o3d = _o3d()
     work = mesh
     if len(work.triangles) > s.texture_triangles:
@@ -481,7 +504,7 @@ def texture(mesh, frames: list[Frame], s: Settings, report: Report, base: float,
     Vs, Fs, UVs, Cs, Ns, Ps = [], [], [], [], [], []
     start = 0
     for p, tris in enumerate(split_pages(V0, F0, pages)):
-        report(f"Texturing: unwrapping the surface, part {p + 1} of {pages} (this can take a few minutes)", base + span * 0.08 * p / pages)
+        report(f"Texturing: unwrapping the surface, part {p + 1} of {pages} (this can take a few minutes)", base + span * p / pages)
         part = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V0), o3d.utility.Vector3iVector(F0[tris]))
         if C0 is not None and len(C0) == len(V0):
             part.vertex_colors = o3d.utility.Vector3dVector(C0)
@@ -513,9 +536,7 @@ def texture(mesh, frames: list[Frame], s: Settings, report: Report, base: float,
         _, first, inverse = np.unique(V, axis=0, return_index=True, return_inverse=True)
         V, colours, normals = V[first], colours[first], normals[first]
         F = inverse.reshape(-1)[F]
-    photos = spread_frames(frames, s.texture_photos)
-    images, keep, stats = bake(V, F, UV, colours, photos, s.texture_size, report, base + span * 0.1, span * 0.9, page_of=page_of)
-    return {"V": V, "F": F[keep], "UV": UV[keep], "normals": normals, "page_of": page_of[keep], "images": images, "stats": stats}
+    return {"V": V, "F": F, "UV": UV, "colours": colours, "normals": normals, "page_of": page_of}
 
 
 def _nearest_colours(mesh, V: np.ndarray):

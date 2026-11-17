@@ -111,15 +111,23 @@ def main():
     ap.add_argument("--images", help="save side-by-side pictures here")
     ap.add_argument("--every", type=int, default=6)
     ap.add_argument("--width", type=int, default=640)
+    ap.add_argument("--geometry", help="score this mesh file's shape only (no texture), e.g. model_dense_colour.ply")
+    ap.add_argument("--cameras", help="cameras.json to use instead of the one in the results folder")
     a = ap.parse_args()
     out = Path(a.result)
     cap = Capture.open(a.capture)
-    cams_path = out / "cameras.json"
+    cams_path = Path(a.cameras) if a.cameras else out / "cameras.json"
     poses = None
     if cams_path.exists():
         poses = {int(k): np.array(v, np.float64).reshape(4, 4) for k, v in json.loads(cams_path.read_text())["cameraToWorld"].items()}
-    V, F, UV, mats, tex = load_obj(out / "model_textured.obj")
-    r = Renderer(V, F, UV, mats, tex)
+    if a.geometry:
+        import open3d as o3d
+        g = o3d.io.read_triangle_mesh(a.geometry)
+        V, F = np.asarray(g.vertices, np.float32), np.asarray(g.triangles, np.int64)
+        r = Renderer(V, F)
+    else:
+        V, F, UV, mats, tex = load_obj(out / "model_textured.obj")
+        r = Renderer(V, F, UV, mats, tex)
     flip = np.diag([1.0, -1.0, -1.0, 1.0])
     geo, front, holes, photo = [], [], [], []
     shown = 0
@@ -147,7 +155,7 @@ def main():
         img, ok = r.colour(c2w, f.intrinsic(w / f.width), w, h)
         with Image.open(f.image) as im:
             ph = np.asarray(im.convert("RGB").resize((w, h), Image.BILINEAR))
-        if ok.mean() > 0.3:
+        if ok.mean() > 0.3 and not a.geometry:
             x, y = img[ok].astype(np.float32), ph[ok].astype(np.float32)
             g = y.mean(0) / np.maximum(x.mean(0), 1)          # overall brightness doesn't count
             photo.append(float(np.abs(np.clip(x * g, 0, 255) - y).mean()))
@@ -162,8 +170,8 @@ def main():
         "depth_error_mm_worst10pct": round(float(np.percentile(geo, 90)) * 1000, 1),
         "in_front_of_lidar_pct": round(float(np.mean(front)) * 100, 2),
         "holes_pct": round(float(np.mean(holes)) * 100, 2),
-        "photo_difference": round(float(np.mean(photo)), 2),
-        "photo_difference_worst10pct": round(float(np.percentile(photo, 90)), 2),
+        "photo_difference": round(float(np.mean(photo)), 2) if photo else None,
+        "photo_difference_worst10pct": round(float(np.percentile(photo, 90)), 2) if photo else None,
         "triangles": int(len(F)),
     }
     print(json.dumps(res, indent=2))

@@ -8,6 +8,7 @@ Photos are brightness-matched to each other, and every texel is sampled from the
 from __future__ import annotations
 
 import math
+import os
 from typing import Callable
 
 import numpy as np
@@ -16,7 +17,7 @@ from PIL import Image, ImageDraw
 from .capture import Frame
 
 Report = Callable[[str, float], None]
-K = 8     # candidate photos remembered per triangle
+K = 24    # candidate photos remembered per triangle (enough to let one photo cover a wide patch)
 
 
 def _load(frame: Frame) -> np.ndarray:
@@ -204,19 +205,52 @@ def choose_photos(V, F, frames, state: dict, report: Report, base: float, span: 
     label[bestS.max(axis=1) <= 0] = -1
     top = bestS.max(axis=1)
 
-    # Follow the neighbours' photo where it also sees the triangle well: bigger patches, fewer seams.
+    # Bigger patches, fewer seams. Where two photos meet on a surface they never line up perfectly, so every
+    # seam is a place where a line can break. Each triangle weighs how well a photo sees it against how many
+    # of its neighbours use that same photo, and this is repeated until it settles.
     report("Texturing: joining patches", base)
     nb = _neighbours(F)
-    for _ in range(20):
-        nl = np.where(nb >= 0, label[np.maximum(nb, 0)], -1)
-        cand = np.where((nl[:, 0] == nl[:, 1]) | (nl[:, 0] == nl[:, 2]), nl[:, 0],
-                        np.where(nl[:, 1] == nl[:, 2], nl[:, 1], -1))
-        score = np.where(bestL == cand[:, None], bestS, 0).max(axis=1)
-        switch = (cand >= 0) & (cand != label) & (score > 0) & (score >= 0.35 * top)
-        if not switch.any():
+    has_nb = nb >= 0
+    safe_nb = np.maximum(nb, 0)
+    rel = bestS / np.maximum(top, 1e-12)[:, None]                 # each candidate photo's score, best = 1
+    # First, as few photos as possible: again and again, take the photo that is a good choice (at least half
+    # as good as the best one) for the most surface still without a photo, and give it all of that surface.
+    share = float(os.environ.get("SCANVAS_SHARE", "0.5"))
+    if share < 1:
+        good = (bestL >= 0) & (bestS > 0) & (rel >= share)
+        left = good.any(axis=1)
+        photos = int(bestL.max()) + 1
+        while left.any():
+            m = good & left[:, None]
+            counts = np.bincount(bestL[m], weights=rel[m], minlength=photos)
+            p = int(counts.argmax())
+            if counts[p] <= 0:
+                break
+            take = (m & (bestL == p)).any(axis=1)
+            label[take] = p
+            left &= ~take
+    rng = np.random.default_rng(0)
+    smooth = float(os.environ.get("SCANVAS_SEAM_WEIGHT", "0.9"))
+    for it in range(24):
+        nl = np.where(has_nb, label[safe_nb], -2)                 # neighbours' photos
+        value = np.full((T, K), -1.0, np.float32)
+        for k in range(K):
+            cand = bestL[:, k]
+            same = (nl == cand[:, None]).sum(axis=1)
+            ok = (cand >= 0) & (bestS[:, k] > 0) & (rel[:, k] >= 0.3)
+            value[:, k] = np.where(ok, rel[:, k] + smooth * same / 3.0, -1.0)
+        pick = np.argmax(value, axis=1)
+        new = bestL[np.arange(T), pick]
+        change = (value[np.arange(T), pick] > 0) & (new != label) & (label >= 0)
+        # Changing every triangle at once can flip-flop; a random half each round settles.
+        change &= rng.random(T) < 0.5
+        if change.sum() < max(10, T // 20000):
             break
-        label[switch] = cand[switch]
-    del nb
+        label[change] = new[change]
+    # How many triangle edges have a different photo on each side (for the log: fewer is better).
+    nl = np.where(has_nb, label[safe_nb], -2)
+    state["seam_edges"] = int(((nl != label[:, None]) & has_nb & (nl >= 0) & (label[:, None] >= 0)).sum() // 2)
+    del nb, value, rel
 
     # Brightness: one gain per photo, then a gentle correction that varies across each patch, so patches from
     # different photos meet without a visible step.
@@ -274,7 +308,7 @@ def bake(V: np.ndarray, F: np.ndarray, UV: np.ndarray, vertex_colors: np.ndarray
         del tex
     stats = {"texture_photos": len(used_all), "untextured_triangles": int(((label < 0) & keep).sum()),
              "triangles": int(keep.sum()), "texture_size": size, "texture_pages": pages,
-             "transient_triangles_removed": int((~keep).sum()),
+             "transient_triangles_removed": int((~keep).sum()), "seam_edges": state.get("seam_edges", 0),
              "views_rejected_hidden": state["hidden"], "views_rejected_changed": state["changed"]}
     return images, keep, stats
 
