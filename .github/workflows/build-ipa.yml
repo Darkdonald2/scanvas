@@ -1,4 +1,5 @@
-# Builds an unsigned Scanvas.ipa on GitHub's Macs and publishes it on the "latest" release,
+# Builds an unsigned Scanvas.ipa on GitHub's Macs and publishes it on the "latest" release (always the newest)
+# and on a numbered release of its own (kept for good),
 # so it can be downloaded straight to an iPhone and opened in AltStore / SideStore.
 name: Build IPA
 on:
@@ -39,3 +40,14 @@ jobs:
           gh release delete latest --yes --cleanup-tag || true
           gh release create latest Scanvas.ipa --title "Scanvas (latest build)" \
             --notes "Built from ${GITHUB_SHA::7}. Download Scanvas.ipa on your iPhone and open it in AltStore."
+      # Every build is also kept under its own numbered release, which is never replaced, so an older
+      # version can always be downloaded again.
+      - name: Keep this build as a numbered release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="app-$(date -u +%Y.%m.%d)-b${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" Scanvas.ipa --target "$GITHUB_SHA" --latest=false \
+            --title "Scanvas iPhone app, build ${GITHUB_RUN_NUMBER} ($(date -u +%Y-%m-%d))" \
+            --notes "$(git log -1 --pretty=%s) (${GITHUB_SHA::7})"

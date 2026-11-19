@@ -39,7 +39,7 @@ DXF units can be millimetres, centimetres, metres, inches or feet. Exports are a
 
 ### On GitHub (no Mac needed)
 
-Every push to `main` runs **Build IPA** in GitHub Actions. It publishes `Scanvas.ipa` on the `latest` release. Download it on your iPhone and open it with AltStore / SideStore, which signs it with your Apple ID.
+Every push to `main` runs **Build IPA** in GitHub Actions. It publishes `Scanvas.ipa` on the `latest` release. Each build is also kept as its own numbered release (`app-<date>-b<number>`, and `studio-<date>-b<number>` for Scanvas Studio), so older versions stay downloadable. Download it on your iPhone and open it with AltStore / SideStore, which signs it with your Apple ID.
 
 ### On a Mac
 

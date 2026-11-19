@@ -103,3 +103,18 @@ jobs:
             for i in 1 2 3 4; do gh release upload studio "$f" --clobber && break; sleep $((i * 10)); done
           done
           gh release view studio --json assets --jq '.assets[].name'
+      # Every build is also kept under its own numbered release, which is never replaced.
+      - name: Keep this build as a numbered release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="studio-$(date -u +%Y.%m.%d)-b${GITHUB_RUN_NUMBER}"
+          for i in 1 2 3 4; do
+            gh release create "$TAG" --target "$GITHUB_SHA" --latest=false \
+              --title "Scanvas Studio, build ${GITHUB_RUN_NUMBER} ($(date -u +%Y-%m-%d))" \
+              --notes "$(git log -1 --pretty=%s) (${GITHUB_SHA::7})" && break
+            sleep $((i * 10))
+          done
+          for f in assets/*; do
+            for i in 1 2 3 4; do gh release upload "$TAG" "$f" --clobber && break; sleep $((i * 10)); done
+          done

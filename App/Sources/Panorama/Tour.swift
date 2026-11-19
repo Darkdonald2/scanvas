@@ -244,6 +244,9 @@ struct TourCaptureView: View {
                         .background(warning ? AnyShapeStyle(.orange.opacity(0.9)) : AnyShapeStyle(.ultraThinMaterial),
                                     in: RoundedRectangle(cornerRadius: 14))
                         .padding(.horizontal)
+                    if phase == .capturing {
+                        HStack { SpotGuide(model: model); Spacer() }.padding(.horizontal)
+                    }
                     if phase == .walking && !tour.stops.isEmpty {
                         HStack {
                             TourMap(points: tour.stops.map { SIMD2($0.position[0], $0.position[2]) }, current: nil,
