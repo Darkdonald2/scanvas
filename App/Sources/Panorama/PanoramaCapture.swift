@@ -50,6 +50,10 @@ final class PanoramaCaptureModel: NSObject, ObservableObject, ARSessionDelegate 
     @Published private(set) var arrow: Double?               // radians clockwise from up, toward the next dot
     @Published private(set) var started = false
     @Published private(set) var moved = false
+    /// How far the phone is from the spot this 360 is being taken from, in metres: x to the user's right,
+    /// y up, z ahead. Nil until the first photo fixes the spot.
+    @Published private(set) var spotOffset: SIMD3<Float>?
+    private var lastOffsetTime: TimeInterval = 0
     @Published private(set) var tooFast = false
     @Published var errorMessage: String?
 
@@ -59,6 +63,10 @@ final class PanoramaCaptureModel: NSObject, ObservableObject, ARSessionDelegate 
     private var origin: SIMD3<Float>?
     private var yaw0: Double = 0
     private var anchor: AnchorEntity?
+    /// Holds the dots and is moved with the camera every frame, so a dot always marks a direction to point
+    /// the phone in, and sits in the circle exactly when the phone points that way, wherever the phone is.
+    private var holder: Entity?
+    private var spotFixed = false
     private var dots: [ModelEntity] = []
     private var highlighted = -1
     private var shots: [PanoShot] = []
@@ -70,7 +78,9 @@ final class PanoramaCaptureModel: NSObject, ObservableObject, ARSessionDelegate 
     private let writer = DispatchQueue(label: "scanvas.pano.writer", qos: .userInitiated)
     private let ciContext = CIContext()
 
-    private static let alignDegrees = 2.5
+    private static let alignDegrees = 3.5
+    /// Further than this from the spot, the photos stop lining up and the user is asked to come back.
+    static let spotLimit: Float = 0.25
     private static let holdSeconds = 0.4
 
     init(folder: URL) {
@@ -102,6 +112,8 @@ final class PanoramaCaptureModel: NSObject, ObservableObject, ARSessionDelegate 
         arrow = nil
         started = false
         moved = false
+        spotFixed = false
+        spotOffset = nil
         setExposureLock(false)
         capturing = true
     }
@@ -133,6 +145,7 @@ final class PanoramaCaptureModel: NSObject, ObservableObject, ARSessionDelegate 
     private func removeDots() {
         if let anchor { arView.scene.removeAnchor(anchor) }
         anchor = nil
+        holder = nil
         dots = []
     }
 
@@ -171,15 +184,19 @@ final class PanoramaCaptureModel: NSObject, ObservableObject, ARSessionDelegate 
     }
 
     private func placeDots(at origin: SIMD3<Float>) {
-        let a = AnchorEntity(world: origin)
+        let a = AnchorEntity(world: SIMD3<Float>(0, 0, 0))
+        let h = Entity()
+        h.position = origin
+        a.addChild(h)
         dots = targets.map { t in
             let dot = ModelEntity(mesh: .generateSphere(radius: 0.035), materials: [UnlitMaterial(color: .white)])
             dot.position = direction(t) * 1.5
-            a.addChild(dot)
+            h.addChild(dot)
             return dot
         }
         arView.scene.addAnchor(a)
         anchor = a
+        holder = h
     }
 
     private func paint(_ i: Int) {
@@ -219,8 +236,25 @@ final class PanoramaCaptureModel: NSObject, ObservableObject, ARSessionDelegate 
             placeDots(at: position)
             started = true
         }
-        let away = simd_distance(position, origin ?? position) > 0.3
-        if away != moved { moved = away }
+        holder?.position = position
+        if spotFixed, let origin {
+            let d = position - origin
+            let away = simd_length(d) > Self.spotLimit
+            if away != moved { moved = away }
+            if now - lastOffsetTime > 0.07 {
+                lastOffsetTime = now
+                // The screen's right edge stays level while the phone tilts up and down, so it gives a steady
+                // "right" and "ahead" even when the camera looks at the ceiling or the floor.
+                var right = SIMD3<Float>(t.columns.1.x, 0, t.columns.1.z)
+                let n = simd_length(right)
+                right = n > 0.2 ? right / n : SIMD3<Float>(Float(cos(cameraHeading)), 0, Float(sin(cameraHeading)))
+                let ahead = simd_cross(SIMD3<Float>(0, 1, 0), right)
+                spotOffset = SIMD3<Float>(simd_dot(d, right), d.y, simd_dot(d, ahead))
+            }
+        } else {
+            // Until the first photo is taken the spot is wherever the phone is.
+            origin = position
+        }
 
         // How fast the phone is turning (degrees a second).
         var speed = 0.0
@@ -315,7 +349,14 @@ final class PanoramaCaptureModel: NSObject, ObservableObject, ARSessionDelegate 
         targets[index].done = true
         paint(index)
         shotsTaken += 1
-        positionSum += SIMD3(t.columns.3.x, t.columns.3.y, t.columns.3.z)
+        let here = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
+        positionSum += here
+        if !spotFixed {
+            // The first photo fixes the spot the rest should be taken from.
+            origin = here
+            spotFixed = true
+            spotOffset = SIMD3<Float>(0, 0, 0)
+        }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         // The first photo sets the exposure; the rest use the same, so their brightness matches.
         if !exposureLocked { setExposureLock(true) }
@@ -379,7 +420,7 @@ final class PanoramaCaptureModel: NSObject, ObservableObject, ARSessionDelegate 
 enum PanoGuide {
     static func message(_ model: PanoramaCaptureModel) -> String {
         if !model.started { return "Hold the phone upright and move it a little to start" }
-        if model.moved { return "Stay in one spot: turn the phone, don't walk" }
+        if model.moved { return "Bring the phone back to the spot: move the dot into the ring" }
         if model.tooFast { return "Turn more slowly" }
         if model.allDone { return "All done" }
         if model.arrow != nil { return "Turn toward the yellow dot" }
@@ -401,6 +442,57 @@ enum PanoGuide {
             }
             .allowsHitTesting(false)
         }
+    }
+}
+
+/// Always on screen while a 360 is being taken: a ring for the spot the first photo was taken from and a dot
+/// for the phone, like a spirit level. The bar on the right is the phone's height.
+struct SpotGuide: View {
+    @ObservedObject var model: PanoramaCaptureModel
+    private let range: Float = 0.3      // metres from the centre to the edge
+
+    var body: some View {
+        let o = model.spotOffset
+        let flat = o.map { simd_length(SIMD2<Float>($0.x, $0.z)) } ?? 0
+        let all = o.map { simd_length($0) } ?? 0
+        let tint: Color = o == nil ? .white : (all < 0.08 ? .green : (all < PanoramaCaptureModel.spotLimit ? .yellow : .orange))
+        VStack(spacing: 4) {
+            HStack(spacing: 8) {
+                ZStack {
+                    Circle().fill(.black.opacity(0.35))
+                    Circle().stroke(.white.opacity(0.5), lineWidth: 1)
+                    Circle().stroke(.white.opacity(0.9), lineWidth: 2).frame(width: 30, height: 30)
+                    Path { p in
+                        p.move(to: CGPoint(x: 48, y: 4)); p.addLine(to: CGPoint(x: 48, y: 92))
+                        p.move(to: CGPoint(x: 4, y: 48)); p.addLine(to: CGPoint(x: 92, y: 48))
+                    }.stroke(.white.opacity(0.25), lineWidth: 1)
+                    if let o {
+                        let k = flat > range ? range / flat : 1
+                        Circle().fill(tint).frame(width: 16, height: 16)
+                            .overlay(Circle().stroke(.black.opacity(0.5), lineWidth: 1))
+                            .offset(x: CGFloat(o.x * k / range) * 40, y: CGFloat(-o.z * k / range) * 40)
+                    }
+                }
+                .frame(width: 96, height: 96)
+                ZStack {
+                    Capsule().fill(.black.opacity(0.35)).frame(width: 12, height: 96)
+                    Rectangle().fill(.white.opacity(0.9)).frame(width: 18, height: 2)
+                    if let o {
+                        let v = max(-range, min(range, o.y))
+                        Capsule().fill(tint).frame(width: 18, height: 8)
+                            .overlay(Capsule().stroke(.black.opacity(0.5), lineWidth: 1))
+                            .offset(y: CGFloat(-v / range) * 44)
+                    }
+                }
+                .frame(width: 18, height: 96)
+            }
+            Text(o == nil ? "Spot set by first photo" : (all < 0.08 ? "On the spot" : "\(Int((all * 100).rounded())) cm off"))
+                .font(.caption2.weight(.semibold).monospacedDigit()).foregroundStyle(tint)
+        }
+        .padding(8)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .animation(.linear(duration: 0.08), value: o)
+        .allowsHitTesting(false)
     }
 }
 
@@ -448,6 +540,7 @@ struct PanoramaCaptureView: View {
                         .padding(.horizontal, 14).padding(.vertical, 8)
                         .background(warning ? AnyShapeStyle(.orange.opacity(0.9)) : AnyShapeStyle(.ultraThinMaterial), in: Capsule())
                         .padding(.horizontal)
+                    HStack { SpotGuide(model: model); Spacer() }.padding(.horizontal)
                     Spacer()
                     Button { finish() } label: {
                         Label(model.allDone ? "Stitch" : "Finish early", systemImage: "checkmark.circle.fill").frame(maxWidth: 220)

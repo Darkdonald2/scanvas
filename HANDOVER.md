@@ -187,6 +187,15 @@ to `main` trigger the builds. Studio-only changes don't rebuild the ipa.
 
 ## 8. Recent fixes (newest first)
 
+- **360 dots follow the phone; spot guide; numbered releases** (19 November 2026). The capture dots were
+  fixed in the room 1.5 m from the starting point, but a photo was taken when the camera *direction* matched,
+  so once the phone drifted 10–20 cm the dot on screen and the direction disagreed by several degrees and the
+  user had to aim beside the dot. The dots now sit on a holder entity that is moved to the camera every frame
+  (`PanoramaCaptureModel.holder`), so a dot is purely a direction; tolerance is 3.5°. The spot is fixed by the
+  first photo (`spotFixed`), and `SpotGuide` (ring = spot, dot = phone, bar = height, range 30 cm) is always
+  shown while capturing in 360 Photo and Tour; the "come back" warning starts at 25 cm. Not yet run on a phone.
+  Both workflows now also publish each build as a numbered release (`app-<date>-b<run>`,
+  `studio-<date>-b<run>`) that is never replaced; `latest` and `studio` still always hold the newest.
 - **Tour mode** (17 November 2026). `Panorama/Tour.swift`. A tour is several 360s ("stops") captured in one
   ARKit session, so every stop has a position in the same world. Capture (`TourCaptureView`) reuses
   `PanoramaCaptureModel`, which can now run several stops in one session (`startIdle`, `beginStop`, `endStop`);
