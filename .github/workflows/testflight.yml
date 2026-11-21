@@ -1,0 +1,109 @@
+# Signs Scanvas and uploads it to TestFlight.
+#
+# Runs on every push to main (and by hand from the Actions tab) once these are set in the repository's
+# Settings › Secrets and variables › Actions:
+#   secrets   ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (the whole .p8 file), APPLE_TEAM_ID
+#   variable  BUNDLE_ID (the bundle ID registered for Scanvas, for example com.yourname.scanvas)
+# Without them it only checks that the app builds with the SDK the App Store requires, and uploads nothing.
+# Signing is automatic: Xcode makes and renews the certificates and profiles through the API key.
+name: TestFlight
+on:
+  push:
+    branches: [main, master]
+    paths-ignore: ["studio/**", ".github/workflows/build-studio.yml", "**.md"]
+  pull_request:
+    paths: [".github/workflows/testflight.yml", "ci/**", "project.yml"]
+  workflow_dispatch:
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+jobs:
+  upload:
+    runs-on: macos-15
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+      TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      BUNDLE_ID: ${{ vars.BUNDLE_ID }}
+      # Each upload needs a higher build number than the last.
+      BUILD_NUMBER: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Xcode 26 (App Store uploads need the iOS 26 SDK)
+        run: |
+          X=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$X" ]; then echo "::error::No Xcode 26 on this runner"; ls -d /Applications/Xcode*; exit 1; fi
+          sudo xcode-select -s "$X"
+          xcodebuild -version
+      - name: Set up
+        id: setup
+        run: |
+          brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
+          xcodegen
+          if [ -n "$ASC_KEY_ID" ] && [ -n "$ASC_ISSUER_ID" ] && [ -n "$ASC_KEY_P8" ] && [ -n "$TEAM_ID" ] && [ -n "$BUNDLE_ID" ] \
+             && [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "sign=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "sign=no" >> "$GITHUB_OUTPUT"
+            echo "::notice::TestFlight secrets are not all set (or this is a pull request): building without signing, nothing is uploaded."
+          fi
+      - name: Build without signing (check only)
+        if: steps.setup.outputs.sign == 'no'
+        run: |
+          set -o pipefail
+          xcodebuild archive -project Scanvas.xcodeproj -scheme Scanvas -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/Scanvas.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$RUNNER_TEMP/build.log" | grep -E "error:|ARCHIVE (SUCCEEDED|FAILED)" || true
+          grep -q "ARCHIVE SUCCEEDED" "$RUNNER_TEMP/build.log"
+      - name: Prepare signing
+        if: steps.setup.outputs.sign == 'yes'
+        run: |
+          # The API key, where xcodebuild expects it.
+          mkdir -p "$RUNNER_TEMP/keys"
+          printf '%s\n' "$ASC_KEY_P8" > "$RUNNER_TEMP/keys/AuthKey_$ASC_KEY_ID.p8"
+          # A keychain of its own for the certificate Xcode creates while archiving.
+          KC="$RUNNER_TEMP/signing.keychain-db"
+          security create-keychain -p ci "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p ci "$KC"
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$KC"
+          sed -e "s/TEAM_ID/$TEAM_ID/" ci/ExportOptions.plist > "$RUNNER_TEMP/ExportOptions.plist"
+      - name: Archive and sign
+        if: steps.setup.outputs.sign == 'yes'
+        run: |
+          set -o pipefail
+          xcodebuild archive -project Scanvas.xcodeproj -scheme Scanvas -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/Scanvas.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/keys/AuthKey_$ASC_KEY_ID.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$TEAM_ID" PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            CODE_SIGN_STYLE=Automatic CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            2>&1 | tee "$RUNNER_TEMP/build.log" | grep -E "error:|warning: .*(sign|profile|certificate)|ARCHIVE (SUCCEEDED|FAILED)" || true
+          grep -q "ARCHIVE SUCCEEDED" "$RUNNER_TEMP/build.log"
+      - name: Upload to TestFlight
+        if: steps.setup.outputs.sign == 'yes'
+        run: |
+          set -o pipefail
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/Scanvas.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/keys/AuthKey_$ASC_KEY_ID.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            2>&1 | tee "$RUNNER_TEMP/export.log" | grep -vE "^\s*$" | tail -40
+          grep -qE "EXPORT SUCCEEDED|Upload succeeded|Uploaded" "$RUNNER_TEMP/export.log"
+          echo "::notice::Build $BUILD_NUMBER uploaded. It shows in TestFlight after Apple finishes processing (usually 5–30 minutes)."
+      - name: Show the log
+        if: failure()
+        run: |
+          for f in "$RUNNER_TEMP/build.log" "$RUNNER_TEMP/export.log"; do
+            [ -f "$f" ] && { grep -E "error|Error|failed" "$f" | sort -u | head -40 | sed 's/^/::error::/'; tail -60 "$f"; }
+          done
+          true
+      - name: Clean up
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/keys"
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
